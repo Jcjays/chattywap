@@ -2,14 +2,18 @@ package com.adonis.chattywap.user;
 
 import com.adonis.chattywap.user.dto.UserCredentials;
 import com.adonis.chattywap.user.dto.UserResponse;
+import com.adonis.chattywap.user.dto.UserSummary;
 import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Collection;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Entry point of the {@code user} feature. Other features call this service, never the repository.
@@ -76,6 +80,19 @@ public class UserService {
 		return userRepository.findById(userId)
 				.map(UserService::toResponse)
 				.orElseThrow(UserNotFoundException::new);
+	}
+
+	/**
+	 * Returns the summaries of those users among {@code userIds} that exist, keyed by user ID. Unknown IDs are
+	 * left out, so the caller can tell which users don't exist. One query for all IDs.
+	 */
+	@Transactional(readOnly = true)
+	public Map<UUID, UserSummary> findUserSummaries(Collection<UUID> userIds) {
+		if (userIds.isEmpty()) {
+			return Map.of();
+		}
+		return userRepository.findAllById(userIds).stream()
+				.collect(Collectors.toMap(User::getId, user -> new UserSummary(user.getId(), user.getDisplayName())));
 	}
 
 	/**

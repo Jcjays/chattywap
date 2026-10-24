@@ -16,7 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Checks the constraints of the Flyway migration directly with SQL, bypassing the application code, so that
+ * Checks the constraints of the Flyway migrations directly with SQL, bypassing the application code, so that
  * the database protects the invariants even if a bug in the code doesn't. Hibernate's schema validation
  * at startup (see {@link ChattywapApplicationIT}) checks that the entities match the same migration.
  */
@@ -35,7 +35,7 @@ class DatabaseSchemaIT {
 		List<String> versions = jdbcTemplate.queryForList(
 				"select version from flyway_schema_history where success order by installed_rank", String.class);
 
-		assertThat(versions).contains("1");
+		assertThat(versions).contains("1", "2");
 	}
 
 	@Test
@@ -122,6 +122,158 @@ class DatabaseSchemaIT {
 
 		assertThat(count("select count(*) from refresh_token_families where id = ?", familyId)).isZero();
 		assertThat(count("select count(*) from refresh_tokens where family_id = ?", familyId)).isZero();
+	}
+
+	@Test
+	void conversationTypeAndMemberRoleMustBeKnown() {
+		UUID userId = insertUser(uniqueEmail());
+
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into conversations (id, type, name, created_by, created_at, updated_at)
+				values (?, 'CHANNEL', 'Name', ?, now(), now())
+				""", UUID.randomUUID(), userId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_type_valid");
+		UUID groupId = insertGroup(userId, "Group");
+		assertThatThrownBy(() -> insertMember(groupId, userId, "OWNER"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversation_members_role_valid");
+	}
+
+	@Test
+	void conversationCreatorMustBeAnExistingUser() {
+		assertThatThrownBy(() -> insertGroup(UUID.randomUUID(), "Group"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_created_by_fkey");
+	}
+
+	@Test
+	void groupConversationNeedsANonBlankNameAndNoDirectPair() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID otherUserId = insertUser(uniqueEmail());
+
+		assertThatThrownBy(() -> insertGroup(userId, null))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_group_shape");
+		assertThatThrownBy(() -> insertGroup(userId, "   "))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_group_shape");
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into conversations (id, type, name, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+				values (?, 'GROUP', 'Group', ?, least(?, ?), greatest(?, ?), now(), now())
+				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_group_shape");
+	}
+
+	@Test
+	void directConversationNeedsBothUsersAndNoName() {
+		UUID userId = insertUser(uniqueEmail());
+
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into conversations (id, type, created_by, direct_user1_id, created_at, updated_at)
+				values (?, 'DIRECT', ?, ?, now(), now())
+				""", UUID.randomUUID(), userId, userId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_direct_shape");
+		UUID otherUserId = insertUser(uniqueEmail());
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into conversations (id, type, name, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+				values (?, 'DIRECT', 'Name', ?, least(?, ?), greatest(?, ?), now(), now())
+				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_direct_shape");
+	}
+
+	@Test
+	void directPairIsUniqueAndOrdered() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID otherUserId = insertUser(uniqueEmail());
+		insertDirect(userId, otherUserId);
+
+		assertThatThrownBy(() -> insertDirect(userId, otherUserId))
+				.isInstanceOf(DuplicateKeyException.class)
+				.hasMessageContaining("conversations_direct_pair_key");
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+				values (?, 'DIRECT', ?, greatest(?, ?), least(?, ?), now(), now())
+				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_direct_pair_ordered");
+	}
+
+	@Test
+	void membershipIsUniquePerConversationAndUser() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		insertMember(groupId, userId, "ADMIN");
+
+		assertThatThrownBy(() -> insertMember(groupId, userId, "MEMBER"))
+				.isInstanceOf(DuplicateKeyException.class)
+				.hasMessageContaining("conversation_members_conversation_user_key");
+	}
+
+	@Test
+	void membershipMustReferenceAnExistingConversationAndUser() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		assertThatThrownBy(() -> insertMember(UUID.randomUUID(), userId, "MEMBER"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversation_members_conversation_id_fkey");
+		assertThatThrownBy(() -> insertMember(groupId, UUID.randomUUID(), "MEMBER"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversation_members_user_id_fkey");
+	}
+
+	@Test
+	void deletingAConversationDeletesItsMemberships() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		insertMember(groupId, userId, "ADMIN");
+
+		jdbcTemplate.update("delete from conversations where id = ?", groupId);
+
+		assertThat(count("select count(*) from conversation_members where conversation_id = ?", groupId)).isZero();
+	}
+
+	@Test
+	void usersInConversationsCannotBeDeleted() {
+		UUID creatorId = insertUser(uniqueEmail());
+		UUID memberId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(creatorId, "Group");
+		insertMember(groupId, memberId, "MEMBER");
+
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from users where id = ?", memberId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversation_members_user_id_fkey");
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from users where id = ?", creatorId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_created_by_fkey");
+	}
+
+	private UUID insertGroup(UUID createdBy, String name) {
+		UUID id = UUID.randomUUID();
+		jdbcTemplate.update("""
+				insert into conversations (id, type, name, created_by, created_at, updated_at)
+				values (?, 'GROUP', ?, ?, now(), now())
+				""", id, name, createdBy);
+		return id;
+	}
+
+	/** Stores the pair in the required order, using PostgreSQL's own comparison. */
+	private void insertDirect(UUID userId, UUID otherUserId) {
+		jdbcTemplate.update("""
+				insert into conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+				values (?, 'DIRECT', ?, least(?, ?), greatest(?, ?), now(), now())
+				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId);
+	}
+
+	private void insertMember(UUID conversationId, UUID userId, String role) {
+		jdbcTemplate.update("""
+				insert into conversation_members (id, conversation_id, user_id, role, joined_at)
+				values (?, ?, ?, ?, now())
+				""", UUID.randomUUID(), conversationId, userId, role);
 	}
 
 	private UUID insertUser(String email) {
