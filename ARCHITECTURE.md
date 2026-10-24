@@ -91,6 +91,13 @@ Rules:
 
 **Event flow**: a feature publishes a domain event (a record in its `dto/` package) with Spring's `ApplicationEventPublisher`. `messaging` listens inside the publishing transaction and writes the event to the outbox, so the change and its event commit together. The relay publishes outbox rows to RabbitMQ, and consumers hand them to services or to `realtime`. Because features never depend on `messaging`, this flow creates no cycle.
 
+## Configuration and test infrastructure
+
+- Connection settings come from environment variables (`POSTGRES_*`, `RABBITMQ_*`) and are referenced in `application.yaml`. Committed configuration holds no credentials. For local development, the values live in an uncommitted `.env` file that Docker Compose reads and the application imports (`spring.config.import`). Real environment variables take precedence.
+- `compose.yaml` runs PostgreSQL and RabbitMQ for local development. The application runs on the host.
+- Unit tests (`*Test`, `*Tests`) run with Surefire in `mvn test` and need no external services. Integration tests (`*IT`) run with Failsafe in `mvn verify` and get PostgreSQL and RabbitMQ from Testcontainers (`TestcontainersConfiguration`, wired with `@ServiceConnection`).
+- Actuator exposes only the health endpoint over HTTP. It shows each component's status, never its details.
+
 ## Unresolved decisions
 
 1. **STOMP broker strategy**: Spring's simple in-memory broker with RabbitMQ (AMQP) fanning events out to every instance, or a STOMP broker relay to RabbitMQ's STOMP plugin. The relay needs an extra dependency (Reactor Netty) and moves work between `realtime` and `messaging`.
@@ -101,4 +108,3 @@ Rules:
 6. **Presence storage**: per-instance memory breaks with more than one instance. The options are PostgreSQL, propagation through RabbitMQ, or a new store such as Redis (new dependency). Also: who may see whose presence.
 7. **IDs and ordering**: UUIDs or sequences, and how message order in a conversation is defined (per-conversation sequence number or timestamp).
 8. **Boundary enforcement**: the rules are currently enforced by review and Java visibility. ArchUnit or Spring Modulith could check them in tests, but either adds a dependency.
-9. **Local and test infrastructure**: no datasource or broker connection is configured, so the application and the existing `contextLoads` test fail at startup. The options are config pointing at locally running services, Spring Boot Docker Compose support, or Testcontainers. The last two add dependencies.

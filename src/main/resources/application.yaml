@@ -1,3 +1,36 @@
 spring:
   application:
     name: chattywap
+  config:
+    # Local development: read settings from .env in the working directory.
+    # Real environment variables take precedence over values in this file.
+    import: optional:file:.env[.properties]
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:chattywap}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+  jpa:
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks that entities match it.
+      ddl-auto: validate
+    open-in-view: false
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      # Report each dependency's UP/DOWN status, but never its details.
+      show-components: always
+      show-details: never
+
+logging:
+  level:
+    com.adonis.chattywap: debug

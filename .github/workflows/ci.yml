@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # "sh" avoids depending on mvnw's executable bit, which commits from Windows often lose.
+      - name: Compile
+        run: sh ./mvnw --batch-mode --no-transfer-progress test-compile
+
+      # Runs unit tests (Surefire) and Testcontainers integration tests (Failsafe).
+      - name: Test
+        run: sh ./mvnw --batch-mode --no-transfer-progress verify

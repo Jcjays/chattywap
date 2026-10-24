@@ -1,0 +1,46 @@
+# Local development services. The application itself runs on the host (IDE or Maven).
+# Credentials come from .env (copy .env.example). Ports are bound to 127.0.0.1 only.
+name: chattywap
+
+services:
+  postgres:
+    image: postgres:18.6
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chattywap}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/<major>/docker.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:4.3.7-management
+    # RabbitMQ stores data per node name (rabbit@<hostname>); a fixed hostname keeps
+    # the data in the volume usable when the container is recreated.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:?set RABBITMQ_USERNAME in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
