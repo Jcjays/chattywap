@@ -1,5 +1,7 @@
 package com.adonis.chattywap.conversation.dto;
 
+import com.adonis.chattywap.common.PageMetadata;
+
 import java.util.List;
 
 /**
@@ -14,8 +16,4 @@ public record ConversationPageResponse(
 		List<ConversationSummaryResponse> content,
 		PageMetadata page,
 		String nextCursor) {
-
-	public record PageMetadata(long size, long number, long totalElements, long totalPages) {
-	}
-
 }

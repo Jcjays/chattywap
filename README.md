@@ -242,7 +242,7 @@ A group is deleted in one of two ways:
 
 Deletion is the same in both cases. In one transaction, all memberships are removed and the conversation is marked deleted (`deleted_at`). For its former members, the group is gone: it disappears from their lists, and every request about it gets `404`, the same as for a conversation that never existed. Nobody can rejoin, rename or restore it; there is no endpoint to undo a deletion.
 
-The conversation row itself is kept, with its name, creator and timestamps. Nothing in the API returns it again. It is kept so that records that refer to the conversation don't have to be deleted with it, or left pointing at nothing. Messages will be such records, once they exist. Memberships are removed because membership is what grants access, and because the schema already treats them as disposable: leaving has always deleted the membership row. No other data is removed.
+The conversation row itself is kept, with its name, creator and timestamps. Nothing in the API returns it again. It is kept so that records that refer to the conversation don't have to be deleted with it, or left pointing at nothing. Messages are such records: a deleted group's messages stay in the database, and nobody can read them through the API. Memberships are removed because membership is what grants access, and because the schema already treats them as disposable: leaving has always deleted the membership row. No other data is removed.
 
 Groups whose last member left before this behavior existed were stored without members. Migration `V3` marks them deleted, with the time the last member left.
 
@@ -404,11 +404,115 @@ Unknown users in the body are a `400`, not a `404`: the endpoint exists, the req
 
 ### Known limitations
 
-- Deleted groups stay in the database indefinitely. There is no retention period and no job that purges them.
+- Deleted groups, and their messages, stay in the database indefinitely. There is no retention period and no job that purges them.
 - Groups that had more than 100 members before the limit existed keep them. Nobody can be added to them until they are below the limit.
 - A conversation that changes while a client pages through the list by cursor moves before the cursor and isn't on the following pages (see [Pagination](#pagination)). Clients see it when they reload the first page.
 - Page numbers can still shift when conversations change. Use cursors to avoid that.
 - Conversation details and membership changes load all members of the conversation. That's cheap with at most 100 members.
+
+## Messages
+
+Members of a conversation can post messages to it and read its history. Both endpoints require an access token (`Authorization: Bearer <accessToken>`). The sender is always the user in the token: a sender ID in the body or the query string is ignored.
+
+| Method and path | Body | Success |
+|---|---|---|
+| `POST /api/v1/conversations/{conversationId}/messages` | `content` | `201` with the stored message |
+| `GET /api/v1/conversations/{conversationId}/messages?page=0&size=20` or `?size=20&cursor=...` | none | `200` with one page of the history, newest message first |
+
+Messages are stored and read through these endpoints only. Delivering them to connected clients as they arrive (WebSocket/STOMP), read receipts, unread counts, editing, deleting, reactions, attachments and search are not part of this API yet.
+
+### Content
+
+- `content` is required and must contain at least one character that isn't whitespace.
+- At most **4000 characters** as sent. Characters outside the Basic Multilingual Plane, such as most emoji, count as two.
+- It is stored and returned exactly as sent, including surrounding whitespace and line breaks.
+- It can't contain the NUL character (`\u0000`), which PostgreSQL can't store, or half of a UTF-16 surrogate pair (for example `\uD83D` without its second half), which isn't valid Unicode text.
+
+### Who can post and read
+
+| Endpoint | Allowed for | Otherwise |
+|---|---|---|
+| Send | Members of the conversation | `404` |
+| History | Members of the conversation | `404` |
+
+- The same rule as for the conversation endpoints: a conversation the caller doesn't belong to, an ID that doesn't exist and a deleted group all get exactly the same `404`. Knowing a conversation's ID, or holding a cursor from its history, grants nothing.
+- Membership is checked in the database on every request. Members who leave or are removed lose access to the whole history at once, their own messages included. Their messages stay for the remaining members, shown with their name.
+- Nobody can post to or read a deleted group. Its messages stay in the database with the conversation row (see [Group lifecycle](#group-lifecycle)).
+- **A message is never stored after its sender stopped being a member.** Sending locks the sender's membership until the message is stored. Leaving, being removed and deleting the group wait for a message that is being sent; a message sent while one of them is in progress waits for it and then gets `404`.
+
+### Examples
+
+Send a message:
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages -H 'Authorization: Bearer <accessToken>' -H 'Content-Type: application/json' -d '{"content": "Who is bringing snacks?"}'
+```
+
+```json
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}
+```
+
+Read the history:
+
+```bash
+curl 'http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages?size=20' -H 'Authorization: Bearer <accessToken>'
+```
+
+```json
+{"content":[{"id":"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"content":"Me!","createdAt":"2026-10-24T10:31:12.654321Z"},{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
+```
+
+- `sender` is the sender's user ID and display name. Email addresses are never included.
+- `createdAt` is when the server stored the message: UTC, ISO 8601, in microseconds. A history entry is identical to the response that sending it returned.
+
+### History order and pagination
+
+The history is ordered **newest first**: `createdAt` descending, then `id` descending. Clients that show the newest message at the bottom reverse each page.
+
+Pagination works exactly like the conversation list (see [Pagination](#pagination)), with the same parameters, defaults and response shape:
+
+- **By cursor** (recommended): request the first page without a cursor, then pass each response's `nextCursor` as `cursor` to get the next, older messages, until `nextCursor` is `null`. With a cursor, `page` is ignored and the response's `page` is `null`. An empty `cursor=` is the first page; an invalid cursor is a `400`.
+- **By page number**: `page` is zero-based, and the response's `page` holds `size`, `number`, `totalElements` and `totalPages`.
+- `size`: default `20`, at most `100` (larger values are reduced to 100). Invalid values fall back to the defaults. A `sort` parameter is ignored.
+
+**When messages arrive while a client pages back through the history:**
+
+- A cursor is a position in the history, so new messages don't shift the following pages: no message appears twice, and none is skipped because others arrived. New messages sort before the cursor; the client gets them by loading the first page again.
+- A message's place in the history is the moment the server stored it, shortly before its transaction committed. If a message takes longer to commit than one sent just after it, it becomes visible second but sorts below the other, possibly in a page the client has already loaded. Reloading the first page shows it; a client that reloads only until it reaches a message it already has can miss it.
+- Page numbers count from the newest message. Every new message shifts all pages by one, so paging back by number shows a message again for each message that arrived. Use cursors to scroll back.
+
+Messages stored in the same microsecond are ordered by ID. That order is the same on every request and in both modes, but among those messages it isn't necessarily the order in which they were sent.
+
+### Errors
+
+Errors use the same problem-detail format as the rest of the API (see [Errors](#errors)).
+
+| Situation | Status | Notes |
+|---|---|---|
+| Missing, blank or too long `content`, or `content` with a NUL character or an unpaired surrogate | `400` | `errors` lists `content`. Rejected values are never echoed. |
+| Malformed JSON, or a malformed conversation ID | `400` | |
+| Invalid `cursor` | `400` | |
+| Missing, malformed, expired or wrongly signed access token | `401` | |
+| Conversation doesn't exist, was deleted, or the caller isn't (or is no longer) a member | `404` | Identical response in all cases |
+| Unexpected server error, including a failure to store the message | `500` | Generic message. Details go to the server log only. Nothing is stored. |
+
+### Design decisions
+
+- **Order by time, then ID.** The server sets `createdAt` (its clock, in microseconds) when it stores a message, and the ID breaks ties, so the order is total. There is no per-conversation sequence number: it would need a counter per conversation that every message locks, which serializes all senders of a conversation. The cost of using the clock: with several application instances, two messages sent within the instances' clock difference can be ordered differently from the order they were stored in; messages stored in the same microsecond are ordered by their random IDs; and the order is when messages were stored, not when they became visible (see [History order and pagination](#history-order-and-pagination)). Real-time delivery will need to take this into account.
+- **Membership checked under a lock.** Sending checks the membership and stores the message in one transaction, with the sender's membership row locked (`SELECT ... FOR KEY SHARE`) in between. That lock conflicts only with deleting the row, so a message being sent directly holds up only leaving, removal and group deletion for that sender: not role changes, renames, additions or other senders. Sending never takes or waits for the conversation lock that group changes take. A removal that waits for a message holds that lock meanwhile, though, so other changes to the group wait behind it for the few milliseconds the message takes to store. Reading the history takes no lock: a read at the same moment as a removal sees the membership from before or after it.
+- **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Storing a message is not delivering it: nothing is pushed to other members yet.
+- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes three queries (membership lock, insert, sender) and a page takes at most four (membership, messages, count, senders), however many senders it has.
+- **Pagination in the database.** Pages use `FETCH FIRST`, and `OFFSET` for page numbers. A page by cursor selects the messages that sort after the cursor with a row comparison, `(created_at, id) < (t, i)`, which PostgreSQL uses as the start of the index scan. The equivalent `created_at < t or (created_at = t and id < i)` filters every newer message instead.
+- **Indexes.** One new index, `messages (conversation_id, created_at, id)`. PostgreSQL reads it backwards for the newest-first order, so pages need no sort. Checked against 1,000,000 messages, 200,000 of them in one conversation: the first page and a cursor page 100,000 messages deep each read a handful of index pages in under 0.1 ms. Membership checks use the existing membership indexes. There is no index on `sender_id`: nothing looks messages up by sender, and users can't be deleted, so it would only slow down inserts.
+- **Database constraints.** Foreign keys to the conversation and the sender (`on delete restrict`: a conversation or a user with messages can't be deleted; nothing in the application deletes either); `content` is `varchar(4000)` and can't be empty or only ASCII whitespace. The API's checks are stricter, so the database constraints only catch bugs.
+- **Shared pagination code.** The cursor encoding and the page metadata moved to `common`, now that two lists use them. The cursor format didn't change, so cursors issued before keep working.
+
+### Known limitations
+
+- Page numbers get slower the further back they go: a page reads and skips every newer message (about 18 ms at an offset of 100,000), and every page by number counts the conversation's messages for `totalElements` (about 40 ms with 200,000 messages). Pages by cursor don't count and take the same time at any depth.
+- Sending a message doesn't change the conversation's `updatedAt`, so the conversation list isn't ordered by latest message.
+- There is no real-time delivery. Clients see new messages by loading the first page of the history again.
+- The history is ordered by when messages were stored, which isn't always the order in which they became visible (see [History order and pagination](#history-order-and-pagination)).
 
 ## Run tests
 
@@ -439,16 +543,24 @@ To run only the authentication tests:
 | `AuthControllerIT` | Registration, email normalization, duplicate emails (also concurrent), validation errors, login, identical errors for wrong password and unknown email |
 | `RefreshTokenIT` | Rotation, hash-only storage, reuse detection, concurrent refreshes, expired and unknown tokens, logout behavior |
 | `UserControllerIT` | `/api/v1/users/me` with valid, missing, malformed, expired, wrongly signed, wrong-issuer and wrong-audience tokens |
-| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3 |
+| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3; message foreign keys, blank and too long content, conversations and users with messages can't be deleted |
 | `DirectPairTest` (unit) | Ordering of a direct conversation's participants the way PostgreSQL orders UUIDs |
-| `ConversationCursorTest` (unit) | Encoding and decoding of list cursors; rejection of cursors the server didn't issue |
+| `KeysetCursorTest` (unit) | Encoding and decoding of list cursors (conversations and messages), a stable format; rejection of cursors the server didn't issue |
 | `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing, pagination by number and by cursor (equal timestamps, changes between pages, invalid cursors), access control (`401`, `403`, `404` for non-members), adding and removing members, the member limit, promoting and demoting (last administrator, invalid changes), renaming, deleting, leaving, the administrator hand-over and the deletion of groups whose last member leaves |
 | `ConversationServiceIT` | Concurrent creation of the same direct conversation; under the conversation lock: concurrent adds of the same user, concurrent adds near the member limit, concurrent leaves, administrators demoting themselves at once, deletion during an addition, the last two members leaving at once; rollback when a membership insert fails or a deletion can't be completed; agreement with PostgreSQL's UUID order |
+| `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed insert is a `500` without details), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), the history's order (equal timestamps), pagination by number and by cursor (new messages between pages, size limit, invalid cursors), no messages from other conversations |
+| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all), also when the removal already holds the conversation lock; what sending doesn't hold up and doesn't wait for; the number of queries per send and per page, however many senders it has |
 
 To run only the conversation tests:
 
 ```bash
-./mvnw verify -Dtest='DirectPairTest,ConversationCursorTest' -Dit.test='ConversationControllerIT,ConversationServiceIT,DatabaseSchemaIT'
+./mvnw verify -Dtest='DirectPairTest,KeysetCursorTest' -Dit.test='ConversationControllerIT,ConversationServiceIT,DatabaseSchemaIT'
+```
+
+To run only the message tests:
+
+```bash
+./mvnw verify -Dtest='KeysetCursorTest' -Dit.test='MessageControllerIT,MessageServiceIT,DatabaseSchemaIT'
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push to `main` and on every pull request.
@@ -472,6 +584,7 @@ Existing migrations:
 | `V1__create_users_and_refresh_tokens.sql` | Creates `users`, `refresh_token_families`, `refresh_tokens` |
 | `V2__create_conversations.sql` | Creates `conversations`, `conversation_members` |
 | `V3__add_group_lifecycle.sql` | Adds `conversations.deleted_at` with its checks; marks groups without members deleted |
+| `V4__create_messages.sql` | Creates `messages` with its history index |
 
 To see which migrations have been applied to the local database:
 

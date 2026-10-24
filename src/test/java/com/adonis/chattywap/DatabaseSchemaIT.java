@@ -42,7 +42,7 @@ class DatabaseSchemaIT {
 		List<String> versions = jdbcTemplate.queryForList(
 				"select version from flyway_schema_history where success order by installed_rank", String.class);
 
-		assertThat(versions).contains("1", "2", "3");
+		assertThat(versions).contains("1", "2", "3", "4");
 	}
 
 	@Test
@@ -277,6 +277,65 @@ class DatabaseSchemaIT {
 				.isEqualTo(1);
 	}
 
+	@Test
+	void messageMustBelongToAnExistingConversationAndSender() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		assertThatThrownBy(() -> insertMessage(UUID.randomUUID(), userId, "Hello"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_conversation_id_fkey");
+		assertThatThrownBy(() -> insertMessage(groupId, UUID.randomUUID(), "Hello"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_sender_id_fkey");
+	}
+
+	@Test
+	void messageContentMustNotBeBlank() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		for (String blank : List.of("", "   ", " \t\n\r\f\u000B ")) {
+			assertThatThrownBy(() -> insertMessage(groupId, userId, blank))
+					.isInstanceOf(DataIntegrityViolationException.class)
+					.hasMessageContaining("messages_content_not_blank");
+		}
+		// Surrounding whitespace is kept.
+		UUID messageId = insertMessage(groupId, userId, "\n Hello \n");
+		assertThat(jdbcTemplate.queryForObject("select content from messages where id = ?", String.class, messageId))
+				.isEqualTo("\n Hello \n");
+	}
+
+	@Test
+	void messageContentHasAtMost4000Characters() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		insertMessage(groupId, userId, "a".repeat(4000));
+		// Characters, not UTF-16 code units: the application's limit of 4000 code units always fits.
+		insertMessage(groupId, userId, "😀".repeat(4000));
+		assertThatThrownBy(() -> insertMessage(groupId, userId, "a".repeat(4001)))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("character varying(4000)");
+	}
+
+	@Test
+	void conversationsAndUsersWithMessagesCannotBeDeleted() {
+		UUID creatorId = insertUser(uniqueEmail());
+		// The database doesn't require senders to be members; that's the application's rule. A sender who
+		// belongs to no conversation shows that the message alone keeps the user.
+		UUID senderId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(creatorId, "Group");
+		insertMessage(groupId, senderId, "Hello");
+
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from conversations where id = ?", groupId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_conversation_id_fkey");
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from users where id = ?", senderId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_sender_id_fkey");
+	}
+
 	/**
 	 * Applies the migrations up to V2 to an empty schema, stores conversations the way the application did before
 	 * V3, then applies V3: groups that had lost all their members become deleted, nothing else changes.
@@ -363,6 +422,15 @@ class DatabaseSchemaIT {
 				insert into conversation_members (id, conversation_id, user_id, role, joined_at)
 				values (?, ?, ?, ?, now())
 				""", UUID.randomUUID(), conversationId, userId, role);
+	}
+
+	private UUID insertMessage(UUID conversationId, UUID senderId, String content) {
+		UUID id = UUID.randomUUID();
+		jdbcTemplate.update("""
+				insert into messages (id, conversation_id, sender_id, content, created_at)
+				values (?, ?, ?, ?, now())
+				""", id, conversationId, senderId, content);
+		return id;
 	}
 
 	private UUID insertUser(String email) {

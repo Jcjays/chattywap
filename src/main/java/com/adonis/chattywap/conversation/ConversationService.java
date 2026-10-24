@@ -1,5 +1,8 @@
 package com.adonis.chattywap.conversation;
 
+import com.adonis.chattywap.common.InvalidCursorException;
+import com.adonis.chattywap.common.KeysetCursor;
+import com.adonis.chattywap.common.PageMetadata;
 import com.adonis.chattywap.conversation.dto.ConversationMemberResponse;
 import com.adonis.chattywap.conversation.dto.ConversationPageResponse;
 import com.adonis.chattywap.conversation.dto.ConversationResponse;
@@ -16,6 +19,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -198,11 +202,10 @@ public class ConversationService {
 				: conversationRepository.findPageByMember(callerId, pageRequest);
 
 		String nextCursor = rows.hasNext() && rows.hasContent()
-				? ConversationCursor.after(rows.getContent().getLast().conversation()).encode()
+				? cursorAfter(rows.getContent().getLast().conversation())
 				: null;
 		return new ConversationPageResponse(toSummaries(callerId, rows.getContent()),
-				new ConversationPageResponse.PageMetadata(rows.getSize(), rows.getNumber(), rows.getTotalElements(),
-						rows.getTotalPages()),
+				new PageMetadata(rows.getSize(), rows.getNumber(), rows.getTotalElements(), rows.getTotalPages()),
 				nextCursor);
 	}
 
@@ -221,15 +224,20 @@ public class ConversationService {
 	 */
 	@Transactional(readOnly = true)
 	public ConversationPageResponse listConversationsAfter(UUID callerId, String cursor, int size) {
-		ConversationCursor position = ConversationCursor.decode(cursor);
+		KeysetCursor position = KeysetCursor.decode(cursor);
 		// One more than requested tells whether another page follows, without a count query.
-		List<ConversationListRow> rows = conversationRepository.findByMemberAfter(callerId, position.updatedAt(),
+		List<ConversationListRow> rows = conversationRepository.findByMemberAfter(callerId, position.time(),
 				position.id(), Limit.of(size + 1));
 
 		boolean hasNext = rows.size() > size;
 		List<ConversationListRow> page = hasNext ? rows.subList(0, size) : rows;
-		String nextCursor = hasNext ? ConversationCursor.after(page.getLast().conversation()).encode() : null;
+		String nextCursor = hasNext ? cursorAfter(page.getLast().conversation()) : null;
 		return new ConversationPageResponse(toSummaries(callerId, page), null, nextCursor);
+	}
+
+	/** The list position right after {@code conversation}: its sort key, {@code (updatedAt, id)}. */
+	private static String cursorAfter(Conversation conversation) {
+		return new KeysetCursor(conversation.getUpdatedAt(), conversation.getId()).encode();
 	}
 
 	private List<ConversationSummaryResponse> toSummaries(UUID callerId, List<ConversationListRow> rows) {
@@ -263,6 +271,40 @@ public class ConversationService {
 		List<ConversationMember> members = memberRepository.findByConversationId(conversationId);
 		requireMember(members, callerId);
 		return toResponse(conversation, members);
+	}
+
+	/**
+	 * Checks that the caller may see what the conversation contains, such as its messages: it exists, isn't
+	 * deleted, and the caller is a member. For other features, which can't read this feature's tables.
+	 *
+	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
+	 */
+	@Transactional(readOnly = true)
+	public void requireMembership(UUID callerId, UUID conversationId) {
+		if (!memberRepository.existsInActiveConversation(conversationId, callerId)) {
+			throw new ConversationNotFoundException();
+		}
+	}
+
+	/**
+	 * Like {@link #requireMembership}, and keeps the caller a member until the calling transaction ends. For
+	 * changes made on the caller's behalf, such as posting a message, that must not be stored once the caller has
+	 * lost access to the conversation.
+	 * <p>
+	 * Locks the caller's membership row. Leaving, being removed and the deletion of the group all delete that row,
+	 * so they wait until the calling transaction ends; if one of them came first, this call waits for it and then
+	 * finds no membership. Nothing else waits for it directly: not role changes, renames or additions, and not other
+	 * members doing the same. It doesn't lock the conversation row either, so it never waits for the lock that group
+	 * changes take. But a leave, removal or deletion that waits holds that lock meanwhile, so other changes to the
+	 * group queue behind it: keep the calling transaction short.
+	 *
+	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
+	 */
+	@Transactional(propagation = Propagation.MANDATORY)
+	public void lockMembership(UUID callerId, UUID conversationId) {
+		if (memberRepository.lockMembershipInActiveConversation(conversationId, callerId).isEmpty()) {
+			throw new ConversationNotFoundException();
+		}
 	}
 
 	/**

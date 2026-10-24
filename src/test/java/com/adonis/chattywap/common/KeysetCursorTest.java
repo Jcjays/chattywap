@@ -1,4 +1,4 @@
-package com.adonis.chattywap.conversation;
+package com.adonis.chattywap.common;
 
 import org.junit.jupiter.api.Test;
 
@@ -11,21 +11,30 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-class ConversationCursorTest {
+class KeysetCursorTest {
 
 	@Test
 	void decodingAnEncodedCursorGivesTheSamePosition() {
 		// Microseconds, the precision PostgreSQL stores.
-		ConversationCursor cursor = new ConversationCursor(Instant.parse("2026-10-24T10:25:00.654321Z"), UUID.randomUUID());
+		KeysetCursor cursor = new KeysetCursor(Instant.parse("2026-10-24T10:25:00.654321Z"), UUID.randomUUID());
 
-		assertThat(ConversationCursor.decode(cursor.encode())).isEqualTo(cursor);
+		assertThat(KeysetCursor.decode(cursor.encode())).isEqualTo(cursor);
 	}
 
 	@Test
 	void encodedCursorsNeedNoEscapingInAQueryString() {
-		ConversationCursor cursor = new ConversationCursor(Instant.now(), UUID.randomUUID());
+		KeysetCursor cursor = new KeysetCursor(Instant.now(), UUID.randomUUID());
 
 		assertThat(cursor.encode()).matches("[A-Za-z0-9_-]+");
+	}
+
+	@Test
+	void theEncodingIsStable() {
+		// Clients may hold cursors issued before the cursor moved to this class; they must stay valid.
+		KeysetCursor cursor = new KeysetCursor(Instant.parse("2026-10-24T10:25:00.654321Z"),
+				UUID.fromString("7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"));
+
+		assertThat(cursor.encode()).isEqualTo(encode("2026-10-24T10:25:00.654321Z,7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"));
 	}
 
 	@Test
@@ -39,7 +48,7 @@ class ConversationCursorTest {
 				encode("2026-10-24T10:25:00Z,"));
 
 		for (String value : invalid) {
-			assertThatThrownBy(() -> ConversationCursor.decode(value))
+			assertThatThrownBy(() -> KeysetCursor.decode(value))
 					.as(value)
 					.isInstanceOf(InvalidCursorException.class);
 		}

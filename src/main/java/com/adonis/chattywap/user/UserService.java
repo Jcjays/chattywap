@@ -13,6 +13,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -91,8 +92,8 @@ public class UserService {
 		if (userIds.isEmpty()) {
 			return Map.of();
 		}
-		return userRepository.findAllById(userIds).stream()
-				.collect(Collectors.toMap(User::getId, user -> new UserSummary(user.getId(), user.getDisplayName())));
+		return userRepository.findSummariesByIdIn(userIds).stream()
+				.collect(Collectors.toMap(UserSummary::id, Function.identity()));
 	}
 
 	/**
