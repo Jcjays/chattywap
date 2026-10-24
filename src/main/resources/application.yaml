@@ -24,6 +24,34 @@ spring:
     port: ${RABBITMQ_PORT:5672}
     username: ${RABBITMQ_USERNAME}
     password: ${RABBITMQ_PASSWORD}
+    # Give up on an unreachable broker after this long instead of the client's default 60 seconds. Nothing in a
+    # request waits for RabbitMQ; the outbox relay simply tries again later.
+    connection-timeout: 5s
+    # Channel operations that wait for the broker's answer (opening a channel, declaring a queue) give up after this
+    # instead of the client's default 10 minutes, so a broker that accepts connections but doesn't answer can't hold
+    # up the relay for long.
+    channel-rpc-timeout: 30s
+    # The outbox relay waits for the broker to confirm every event, and counts an event that no queue received
+    # (published as mandatory, so the broker returns it) as failed.
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+    listener:
+      simple:
+        # The container acknowledges a message after the listener returned, and rejects it if the listener threw.
+        # A rejected message is never requeued: it goes to its queue's dead-letter exchange.
+        acknowledge-mode: auto
+        default-requeue-rejected: false
+        prefetch: 10
+        retry:
+          # Failures are retried in the listener with exponential backoff before the message is dead-lettered:
+          # 1 attempt plus max-retries. Invalid events aren't retried (see messaging.MessagingConfig).
+          enabled: true
+          max-retries: 3
+          initial-interval: 1s
+          multiplier: 2
+          max-interval: 10s
 
 chattywap:
   auth:
@@ -40,6 +68,23 @@ chattywap:
     # https://*.example.com allowed), besides pages served by this application. Empty by default.
     # Clients that send no Origin header, such as mobile apps, aren't affected.
     allowed-origins: ${WEBSOCKET_ALLOWED_ORIGINS:}
+  messaging:
+    outbox:
+      # Whether this instance publishes outbox events to RabbitMQ. Every instance may: they never claim the same
+      # event at the same time.
+      relay-enabled: true
+      # Pause between two runs of the relay. A run publishes everything that is due, in batches.
+      poll-interval: 1s
+      batch-size: 100
+      # How long the relay waits for the broker to confirm a batch. Unconfirmed events count as failed.
+      confirm-timeout: 10s
+      # How long a claimed event is reserved for the instance that claimed it. If that instance stops before
+      # recording the outcome, another one publishes the event again afterwards. Must exceed confirm-timeout.
+      lease: 60s
+      # Delay before retrying a failed event, doubled after every further failure, up to max-retry-delay.
+      # Failed events are retried until they are published; they are never dropped.
+      initial-retry-delay: 1s
+      max-retry-delay: 5m
 
 management:
   endpoints:

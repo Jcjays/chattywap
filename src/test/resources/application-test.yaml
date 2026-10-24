@@ -4,3 +4,23 @@ chattywap:
   auth:
     # Base64 of "test-only-signing-key-for-integration-tests". Known to everyone: never use it outside tests.
     jwt-secret: dGVzdC1vbmx5LXNpZ25pbmcta2V5LWZvci1pbnRlZ3JhdGlvbi10ZXN0cw==
+  messaging:
+    outbox:
+      # Tests that publish run the relay themselves (OutboxRelay#publishPending), so that nothing publishes or
+      # consumes in the background of tests that count statements or hold locks. BrokerOutageIT turns it on.
+      relay-enabled: false
+      poll-interval: 200ms
+      confirm-timeout: 5s
+      lease: 10s
+      initial-retry-delay: 200ms
+      max-retry-delay: 1s
+
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          # Short delays, so that tests of retries and dead-lettering don't wait long. 3 attempts in all.
+          max-retries: 2
+          initial-interval: 50ms
+          max-interval: 200ms

@@ -253,10 +253,10 @@ class MessageServiceIT {
 		assertThat(byNumberTen).isEqualTo(byNumberOne).isEqualTo(4);
 		assertThat(byCursorTen).isEqualTo(byCursorOne).isEqualTo(3);
 		// Sending: the membership check, the conversation lock, the membership check under the lock, the members (the
-		// message's recipients), the sender, the message and the conversation's activity time. One statement for the
-		// members, however many there are.
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(7);
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(7);
+		// message's recipients), the sender, the message, its outbox event and the conversation's activity time. One
+		// statement for the members, however many there are.
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(8);
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(8);
 	}
 
 	/**

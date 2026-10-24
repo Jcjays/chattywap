@@ -84,7 +84,7 @@ curl http://localhost:8080/actuator/health
 ```
 
 - `db` is PostgreSQL, `rabbit` is RabbitMQ. You can query one component at a time, for example `/actuator/health/db`.
-- If a dependency is unavailable, its component and the overall status become `DOWN`, and the endpoint returns HTTP 503.
+- If a dependency is unavailable, its component and the overall status become `DOWN`, and the endpoint returns HTTP 503. Without RabbitMQ, the application still stores and delivers messages; only publishing their events waits (see [Asynchronous events](#asynchronous-events-rabbitmq-and-the-transactional-outbox)). The readiness probe, `/actuator/health/readiness`, doesn't depend on RabbitMQ.
 - Only the health endpoint is exposed over HTTP. It shows each component's status, never its details.
 
 ## Authentication
@@ -503,7 +503,7 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 - **Membership checked under the conversation lock.** Sending takes the conversation lock that every group change takes, after checking that the sender is a member, checks the membership again under the lock, stores the message and moves the conversation's `updatedAt` to the message's time, all in one transaction. Leaving, removal and group deletion wait for a message that is being sent, and a message sent while one of them is in progress waits for it and is then rejected. Taking the conversation lock first, like every group change, also means sends and group changes can't deadlock. Reading the history takes no lock: a read at the same moment as a removal sees the membership from before or after it.
 - **Conversation activity.** Sending a message moves the conversation's `updatedAt`, its activity time, to the message's `createdAt`, so the conversation moves to the top of its members' lists. The update is part of the message's transaction: if storing the message fails, `updatedAt` keeps its old value. `updatedAt` is reused rather than adding a separate field, so the conversation list's order, cursors and JSON stay as they were; `updatedAt` simply also counts messages as activity now. It has no index, so updating it on every message touches no index.
 - **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Only after the commit is the message delivered to connected members (see [Real-time messaging](#real-time-messaging-websocket-and-stomp)), so a message that couldn't be stored is never delivered.
-- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes seven statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, sender, insert, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
+- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes eight statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, sender, insert, its outbox event, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
 - **Pagination in the database.** Pages use `FETCH FIRST`, and `OFFSET` for page numbers. A page by cursor selects the messages that sort after the cursor with a row comparison, `(created_at, id) < (t, i)`, which PostgreSQL uses as the start of the index scan. The equivalent `created_at < t or (created_at = t and id < i)` filters every newer message instead.
 - **Indexes.** One new index, `messages (conversation_id, created_at, id)`. PostgreSQL reads it backwards for the newest-first order, so pages need no sort. Checked against 1,000,000 messages, 200,000 of them in one conversation: the first page and a cursor page 100,000 messages deep each read a handful of index pages in under 0.1 ms. Membership checks use the existing membership indexes. There is no index on `sender_id`: nothing looks messages up by sender, and users can't be deleted, so it would only slow down inserts.
 - **Database constraints.** Foreign keys to the conversation and the sender (`on delete restrict`: a conversation or a user with messages can't be deleted; nothing in the application deletes either); `content` is `varchar(4000)` and can't be empty or only ASCII whitespace. The API's checks are stricter, so the database constraints only catch bugs.
@@ -675,8 +675,8 @@ Stopping at a known `id` relies on history order matching the order in which mes
 
 - **Authentication in the CONNECT frame, not the handshake.** STOMP clients can set `CONNECT` headers everywhere, also where they can't set HTTP headers on the WebSocket handshake (browsers). The handshake (`GET /ws`) is therefore public; every other HTTP rule is unchanged, so all other paths, including other methods on `/ws`, still need an access token. A connection can do nothing before its `CONNECT` is accepted, and Spring closes connections that send no frame within a minute. The token is validated by Spring Security's JWT authentication provider with the application's `JwtDecoder`, the same as for REST, and removed from the `CONNECT` frame afterwards so it isn't passed on.
 - **Deny by default.** An interceptor (`realtime.StompSecurityInterceptor`) checks every frame before any handler or the broker sees it: which commands, which destinations, whose token. The decisions themselves stay with the services: `ConversationService.requireMembership` decides subscriptions, and `MessageService` decides sends, exactly as for REST.
-- **Recipients are fixed when the message is stored.** Sending reads the conversation's members under the conversation lock that every send and membership change takes, and publishes them with the message. Delivery goes only to their connections: a subscription that outlived its user's membership receives nothing. A member removed after the message was stored still receives it, as they could still read it in the history at that moment. Reading the members adds one statement to every send (seven in all).
-- **Delivered after the commit, from one place.** `MessageService` publishes a `MessageSentEvent` for every stored message. `realtime.MessageBroadcaster` delivers it once the transaction has committed (`@TransactionalEventListener`), so REST and STOMP sends share one path and nothing is delivered twice or before it exists. If delivery fails, the message stays stored and the send still succeeds; the failure is logged. There is no transactional outbox yet: a message whose delivery is lost (for example because the application stops right after the commit) is only in the history.
+- **Recipients are fixed when the message is stored.** Sending reads the conversation's members under the conversation lock that every send and membership change takes, and publishes them with the message. Delivery goes only to their connections: a subscription that outlived its user's membership receives nothing. A member removed after the message was stored still receives it, as they could still read it in the history at that moment. Reading the members adds one statement to every send (eight in all, with the outbox event).
+- **Delivered after the commit, from one place.** `MessageService` publishes a `MessageSentEvent` for every stored message. `realtime.MessageBroadcaster` delivers it once the transaction has committed (`@TransactionalEventListener`), so REST and STOMP sends share one path and nothing is delivered twice or before it exists. If delivery fails, the message stays stored and the send still succeeds; the failure is logged. WebSocket delivery deliberately doesn't go through the transactional outbox or RabbitMQ (see [Asynchronous events](#asynchronous-events-rabbitmq-and-the-transactional-outbox)): it stays immediate and works while RabbitMQ is down, and a message whose delivery is lost (for example because the application stops right after the commit) is only in the history. Its `MessageCreated` event, which is durable, isn't delivered over WebSocket again.
 - **Order kept per connection.** Frames from one connection are processed in order, and messages to one connection are sent in the order they were published (Spring's `preserveReceiveOrder` and `preservePublishOrder`). Without that, Spring processes a connection's frames in parallel, and two messages sent in a row could be stored in the opposite order. The cost: one connection's frames wait for each other. Because Spring's ordering only logs exceptions thrown while checking a frame, the interceptor sends its `ERROR` frames itself.
 - **Errors as problem details.** `ERROR` frames and error-queue messages use the same format, statuses and messages as REST errors, so clients handle both alike.
 
@@ -689,6 +689,158 @@ Stopping at a known `id` relies on history order matching the order in which mes
 - New conversations, membership changes and deleted groups aren't announced over the WebSocket.
 - Delivery order across senders can differ from the history order (see [Order and delivery](#order-and-delivery)).
 - No STOMP heartbeats from the server.
+
+## Asynchronous events (RabbitMQ and the transactional outbox)
+
+Every stored message also produces a durable `MessageCreated` event, published to RabbitMQ for asynchronous consumers such as push notifications, unread counts or analytics in later milestones. PostgreSQL stays the source of truth for messages and conversations; RabbitMQ carries events and is never read as message history.
+
+The event is written to an outbox table in the same transaction as the message, and a relay publishes it to RabbitMQ after the commit. Sending a message never waits for RabbitMQ and works while it is down.
+
+### WebSocket delivery and durable events
+
+The two paths are independent. Both start from the same stored message, and neither repeats the other.
+
+| | WebSocket delivery | `MessageCreated` event |
+|---|---|---|
+| Receivers | Members connected to this instance | RabbitMQ consumers |
+| When | Right after the commit, in the sending thread | When the relay has published it, normally within a second |
+| Guarantee | At most once, best effort; not retried | At least once; retried until published |
+| Needs RabbitMQ | No | Yes, but storing the message doesn't wait for it |
+| If the application stops right after the commit | The live delivery is lost; the history has the message | Nothing is lost: the event is in the outbox |
+
+The example consumer of `MessageCreated` events doesn't deliver anything over WebSocket.
+
+### The `MessageCreated` event
+
+Version 1, `messaging.dto.MessageCreatedEvent`, published to the exchange `chattywap.events` with routing key `message.created`. The body is JSON, serialized like the REST API's JSON:
+
+```json
+{"eventId":"4e1f2a3b-5c6d-4e7f-8a9b-0c1d2e3f4a5b","eventType":"MessageCreated","eventVersion":1,"occurredAt":"2026-10-24T10:30:00.123456Z","messageId":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","senderId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11"}
+```
+
+| Field | Meaning |
+|---|---|
+| `eventId` | Unique per event, the same in every delivery of it. Consumers deduplicate by it. |
+| `eventType`, `eventVersion` | `MessageCreated`, `1` |
+| `occurredAt` | When the message was stored: its `createdAt` |
+| `messageId`, `conversationId`, `senderId` | The stored message, its conversation and its sender |
+
+- The event never contains the message's content, the sender's name or email address, or tokens. Consumers that need more read it through the owning feature.
+- AMQP properties: `message_id` is the `eventId`, `type` is `MessageCreated`, `content_type` is `application/json`, and the message is persistent.
+- Compatible changes (new optional fields) keep the version; consumers ignore fields they don't know. Removing, renaming or changing the meaning of a field is a new version. A consumer rejects versions and types it doesn't know, to its dead-letter queue.
+
+### Exchanges and queues
+
+The application declares these when it connects to RabbitMQ, and again after every reconnect.
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `chattywap.events` | Topic exchange, durable | All application events. The routing key names the event: `message.created`. |
+| `chattywap.message-counts` | Quorum queue, durable | The example consumer's queue, bound to `message.created`. Rejected messages, and messages delivered 10 times without being acknowledged, go to `chattywap.events.dead-letter`. |
+| `chattywap.events.dead-letter` | Direct exchange, durable | Receives the messages consumers rejected, with their queue's name as routing key. |
+| `chattywap.message-counts.dead-letter` | Quorum queue, durable | Dead letters of the example consumer, kept for investigation. Nothing consumes it. |
+
+Queue arguments can't change on an existing queue. Changing them needs a new queue name, or deleting the queue first (`docker compose down -v` locally).
+
+### Outbox lifecycle
+
+1. **Write.** `MessageService.sendMessage` stores the message. Still in its transaction, `messaging.OutboxWriter` inserts the event into `outbox_events`, pending: `published_at` empty, `attempts` 0, due at once. The message, its event and the conversation's activity time commit together. If any of them fails, all roll back, and no event exists for a message that wasn't stored.
+2. **Claim.** Every `poll-interval` (1 second), `messaging.OutboxRelay` claims up to `batch-size` (100) due events in one short statement. The claim counts the attempt and reserves the events for the `lease` (60 seconds). Rows other relays are claiming at that moment are skipped (`for update skip locked`), so several application instances never claim the same event at the same time. No lock or transaction is held from here on.
+3. **Publish.** The relay publishes each event and waits up to `confirm-timeout` (10 seconds) for RabbitMQ's publisher confirms.
+4. **Record.** Events RabbitMQ acknowledged and didn't return get `published_at`. Every other outcome is a failed attempt: a negative acknowledgement, a returned message (no queue is bound to its routing key), no confirmation in time, or a broker that can't be reached. The event stays pending with the error in `last_error`, and is due again after a delay of 1 second, doubled after every further failure, up to 5 minutes. Events are retried until they are published; none is dropped.
+
+A batch always ends before its lease, so no other relay claims its events while it still works on them: sending stops at the first failed send (the rest of the batch would wait and fail the same way) and once only the confirm timeout is left of the lease; the events not sent are failed attempts. A relay whose lease expired anyway (a long pause) can't record a failure for an event another relay has claimed since. A run continues with the next batch as long as batches are full. The relay publishes on a connection of its own, so a broker that blocks publishers (memory or disk alarm) doesn't block consumers. Published rows are kept; nothing deletes them yet.
+
+### Consumers, retries and idempotency
+
+The example consumer, `messaging.MessageCountConsumer`, counts the `MessageCreated` events of each conversation in `conversation_message_counts`. It's the smallest effect that shows whether processing is reliable: a duplicate applied twice would make a count too high. Nothing in the API reads it.
+
+- **Acknowledgement.** The listener container acknowledges a message after the listener returned, so after the consumer's transaction committed (`acknowledge-mode: auto`). If the listener throws, the message is rejected and never requeued (`default-requeue-rejected: false`).
+- **Retries.** Failures are retried inside the listener, with backoff: 4 attempts in all, 1, 2 and 4 seconds apart. Invalid events (unreadable JSON, missing fields, another type or version), data the database rejects (an unknown conversation) and other failures that would repeat aren't retried.
+- **Dead-lettering.** After the last attempt, or at once for those failures, the message is rejected and RabbitMQ moves it to the consumer's dead-letter queue, at least once: the queue keeps it until the dead-letter queue has accepted it. The application logs the event ID and the cause, never the body. A message that crashes the application before it can be rejected is dead-lettered by RabbitMQ after 10 deliveries.
+- **Idempotency.** In the transaction of its effect, the consumer inserts `(consumer_name, event_id)` into `processed_events` with `on conflict do nothing`. If the row already exists, the event was processed before, and nothing changes. The record and the effect commit together, so a crash between them leaves neither, and the redelivered event is processed normally.
+
+**Why an event can arrive twice.** Publishing and recording the publication are two steps on two systems. If the relay stops, or PostgreSQL fails, after RabbitMQ confirmed an event but before `published_at` is set, the event stays pending and is published again once its lease expires. A confirmation that arrives after the timeout has the same result. RabbitMQ also redelivers a message whose consumer stopped before acknowledging it. Delivery is therefore **at least once**, not exactly once. Deduplicating by `eventId` in the consumer's own transaction makes the effect in PostgreSQL happen once per event however often it's delivered. Effects outside PostgreSQL (an email, a push notification) can't be made exactly once this way; such consumers must tolerate duplicates themselves.
+
+### Failure behavior
+
+| Situation | What happens |
+|---|---|
+| The message's transaction fails | The message and its event both roll back. Nothing is published. |
+| RabbitMQ is down | Sending (REST and STOMP), the history and WebSocket delivery keep working. Events stay pending; the relay retries with growing delays (at most 5 minutes apart) and publishes them once RabbitMQ is back. `/actuator/health` reports `rabbit` and the overall status `DOWN` (`503`) meanwhile; the readiness probe (`/actuator/health/readiness`) doesn't include RabbitMQ, so use it to decide whether an instance takes requests. |
+| The application stops while publishing | Claimed events are due again when their lease expires, and every instance may publish them. Events RabbitMQ had already accepted are published a second time. |
+| The consumer stops before acknowledging | RabbitMQ delivers the message again. The deduplication makes that harmless. |
+| A transient failure while processing | Retried in the listener, then processed. |
+| A poison message | Dead-lettered after its retries, or at once if it's invalid. The queue isn't blocked. |
+| Shutdown | The relay starts no new batch and finishes the current one (waiting up to the lease), so it doesn't stop between a confirmation and recording it. The listener container finishes the message in progress; unacknowledged messages are redelivered after the restart. |
+
+### Configuration
+
+The connection uses the `RABBITMQ_*` variables from [Configure the local environment](#configure-the-local-environment). The relay's settings, in `application.yaml`, can be overridden like any Spring property, for example `CHATTYWAP_MESSAGING_OUTBOX_POLLINTERVAL=5s`:
+
+| Property | Default | Meaning |
+|---|---|---|
+| `chattywap.messaging.outbox.relay-enabled` | `true` | Whether this instance publishes outbox events. Events are still written when it's off. |
+| `chattywap.messaging.outbox.poll-interval` | `1s` | Pause between two runs of the relay |
+| `chattywap.messaging.outbox.batch-size` | `100` | Events claimed and published together (1 to 1000) |
+| `chattywap.messaging.outbox.confirm-timeout` | `10s` | How long to wait for RabbitMQ to confirm a batch |
+| `chattywap.messaging.outbox.lease` | `60s` | How long a claimed event is reserved. Must be longer than `confirm-timeout`. |
+| `chattywap.messaging.outbox.initial-retry-delay`, `max-retry-delay` | `1s`, `5m` | Delay after the first failed attempt, and its maximum |
+| `spring.rabbitmq.listener.simple.retry.*` | 3 retries, 1s, ×2, at most 10s | Consumer retries |
+| `spring.rabbitmq.connection-timeout` | `5s` | How long to wait for an unreachable broker |
+
+Publisher confirms (`publisher-confirm-type: correlated`), returns and mandatory publishing are required by the relay; don't turn them off.
+
+### Logs and metrics
+
+The relay and the consumer log event IDs, never event bodies: each failed attempt at `WARN` (with the reason and the next delay), each dead-lettered message at `ERROR`. Published and processed events are logged at `DEBUG`.
+
+| Metric | Meaning |
+|---|---|
+| `chattywap.outbox.pending` | Events not published yet (read from the database) |
+| `chattywap.outbox.oldest.pending.age` | Age in seconds of the oldest event not published yet; 0 if there is none |
+| `chattywap.outbox.published` | Events RabbitMQ confirmed |
+| `chattywap.outbox.failed` | Failed publication attempts, by `reason`: `nack`, `returned`, `timeout`, `unreachable`, `send-error`, `out-of-time` |
+| `chattywap.outbox.retried` | Attempts for events that had been claimed before |
+| `chattywap.events.consumed` | Events processed, by `outcome`: `processed`, or `duplicate` when skipped |
+| `chattywap.events.consumer.failures` | Failed processing attempts, retries included |
+| `chattywap.events.dead.lettered` | Messages this application dead-lettered, by `queue` |
+
+Only the health endpoint is exposed over HTTP. To read metrics locally, start the application with `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,metrics` and call `/actuator/metrics/chattywap.outbox.pending` with an access token.
+
+### Troubleshooting
+
+Events that aren't published yet, oldest first, with their last error:
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select id, event_type, attempts, next_attempt_at, last_error, created_at from outbox_events where published_at is null order by created_at limit 50"'
+```
+
+The event of a message, and whether the example consumer processed it (`select * from processed_events where event_id = '<eventId>'`):
+
+```sql
+select id, published_at, attempts, last_error from outbox_events where payload::jsonb ->> 'messageId' = '<messageId>';
+```
+
+To retry a pending event now instead of waiting for its delay: `update outbox_events set next_attempt_at = now() where id = '<eventId>' and published_at is null;`
+
+Queues and their depths:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name type messages messages_unacknowledged
+```
+
+Dead letters: open the management UI (<http://localhost:15672>), *Queues and Streams* → `chattywap.message-counts.dead-letter` → *Get messages*. The message ID is the event ID; the `x-first-death-reason` header says why it was dead-lettered (`rejected`: by the consumer, `delivery_limit`: too many redeliveries) and `x-first-death-queue` where from. The consumer's log line for that event ID has the cause. After fixing the cause, the simplest replay goes through the outbox, which keeps every event: `update outbox_events set published_at = null, next_attempt_at = now() where id = '<eventId>';` republishes it, and consumers that processed it already skip it. Then purge the dead letter.
+
+### Known limitations
+
+- **At least once, not exactly once.** Consumers must deduplicate (see above). The example consumer does, in PostgreSQL.
+- **No order.** Retries and several relays publish events in any order. Consumers that need order must use `occurredAt` or read the current state.
+- **Tables grow without bound.** Published `outbox_events` and `processed_events` rows are never deleted. The relay's queries use a partial index of pending events, so the growth doesn't slow them down, but a cleanup is needed eventually. It must keep `processed_events` longer than an event can still be redelivered or replayed.
+- **Unroutable events are retried indefinitely**, every 5 minutes at most, for example after a binding was removed by mistake. `chattywap.outbox.failed{reason=returned}` and `last_error` show it.
+- **Retries hold the consumer.** Retry delays run inside the listener, so a failing message delays the messages behind it by up to 7 seconds before it is dead-lettered.
+- **Dead letters aren't replayed automatically**, and nothing alerts on them besides the metric and the log.
+- **One RabbitMQ node** in Compose: the quorum queues have no replicas there.
 
 ## Run tests
 
@@ -729,7 +881,15 @@ To run only the authentication tests:
 | `StompSecurityIT` | Over a real WebSocket connection: `CONNECT` with a valid token (the connection's user), with malformed, wrongly signed, expired, wrong-issuer and wrong-audience tokens, and without a bearer token; a token on the handshake is ignored; frames before `CONNECT` and unsupported frames; other origins can't connect; the rest of HTTP still needs a token; members can subscribe, non-members, former members and deleted groups get the same `404` as unknown IDs; patterns, other users' queues and other destinations are rejected; removed members stop receiving; non-members can't send; sending to broker destinations is rejected; the sender is always the connection's user; no `SUBSCRIBE` or `SEND` after the token expired |
 | `StompMessagingIT` | Over real WebSocket connections: a message is stored before it is delivered, to every subscriber including the sender, with the stored ID and time and the same JSON as the history; a message whose commit fails is reported to the sender only and never delivered; messages reach only their own conversation's topic; each message is delivered once, sent through REST or STOMP; invalid and unreadable messages are answered on the error queue and the connection stays open; one connection's messages are stored and delivered in the order sent; concurrent senders: every message stored once, delivered once, each sender's order kept; messages missed while disconnected are in the history |
 
-The STOMP tests run against a server on a random port (`webEnvironment = RANDOM_PORT`), so they start their own application context and containers.
+| `OutboxRelayTest` (unit) | What the relay makes of each broker answer (acknowledged, rejected, returned, unconfirmed, unreachable); any failed send ends the batch, and so does the end of the time for sending; batches, shutdown, the retry delay |
+| `MessageCountConsumerTest` (unit) | Reading and validating events: unreadable, incomplete, other types and versions are rejected without processing; unknown fields are ignored |
+| `MessagingConfigTest` (unit) | Which consumer failures are retried |
+| `OutboxIT` | Every stored message has exactly one pending `MessageCreated` event with the contract's fields and no content; a failure to write the event rolls back the message, and a message that can't be stored leaves no event; writing needs the sender's transaction |
+| `OutboxRelayIT` | Against a real broker: events are marked published only after RabbitMQ confirmed them; returned (unroutable), rejected (nack) and unconfirmed (paused broker) events stay pending with their error and are retried after their delay; batches; an event whose publication couldn't be recorded is published again and processed once; a claim's lease, and a relay whose lease expired can't record a failure any more; concurrent claims get different events without waiting; concurrent relays publish every event once |
+| `MessageCountConsumerIT` | Against a real broker: an event is processed and acknowledged; duplicate deliveries count once; transient failures are retried; an event that keeps failing is dead-lettered after its retries without any effect, with what's needed to investigate it, and doesn't block the queue; invalid events and events about unknown conversations are dead-lettered at once |
+| `BrokerOutageIT` | Over real WebSocket connections, with the scheduled relay: every message's event is published and processed once, and the consumer delivers nothing over WebSocket; while RabbitMQ is stopped, messages sent through REST and STOMP are stored and delivered, their events stay pending with errors, and are published and processed once after it restarts |
+
+The STOMP tests and `BrokerOutageIT` run against a server on a random port (`webEnvironment = RANDOM_PORT`). They, and `OutboxRelayIT`, start their own application context and containers. `OutboxRelayIT` and `BrokerOutageIT` pause or stop their RabbitMQ container, which no other test uses. The test profile turns the scheduled relay off; `OutboxRelayIT` runs the relay itself, and `BrokerOutageIT` turns the schedule on.
 
 To run only the conversation tests:
 
@@ -747,6 +907,12 @@ To run only the real-time (WebSocket/STOMP) tests:
 
 ```bash
 ./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT'
+```
+
+To run only the asynchronous-event tests (outbox, relay, consumer):
+
+```bash
+./mvnw verify -Dtest='OutboxRelayTest,MessageCountConsumerTest,MessagingConfigTest' -Dit.test='OutboxIT,OutboxRelayIT,MessageCountConsumerIT,BrokerOutageIT'
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push to `main` and on every pull request.
@@ -771,6 +937,7 @@ Existing migrations:
 | `V2__create_conversations.sql` | Creates `conversations`, `conversation_members` |
 | `V3__add_group_lifecycle.sql` | Adds `conversations.deleted_at` with its checks; marks groups without members deleted |
 | `V4__create_messages.sql` | Creates `messages` with its history index |
+| `V5__create_outbox_and_processed_events.sql` | Creates `outbox_events` with a partial index of pending events, `processed_events`, and the example consumer's `conversation_message_counts` |
 
 To see which migrations have been applied to the local database:
 
