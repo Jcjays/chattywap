@@ -1,5 +1,6 @@
 package com.adonis.chattywap.message;
 
+import com.adonis.chattywap.message.dto.UnreadCountResponse;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -7,7 +8,9 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -47,5 +50,29 @@ interface MessageRepository extends JpaRepository<Message, UUID> {
 			order by m.createdAt desc, m.id desc
 			""")
 	List<Message> findByConversationAfter(UUID conversationId, Instant createdAt, UUID id, Limit limit);
+
+	/**
+	 * The conversation's highest sequence number, 0 if it has no messages. PostgreSQL reads the last entry of the
+	 * index on {@code (conversation_id, sequence_number)}.
+	 */
+	@Query("select coalesce(max(m.sequenceNumber), 0) from Message m where m.conversationId = :conversationId")
+	long findLastSequenceNumber(UUID conversationId);
+
+	/** The message's sequence number, if it is a message of this conversation. */
+	@Query("select m.sequenceNumber from Message m where m.id = :id and m.conversationId = :conversationId")
+	Optional<Long> findSequenceNumber(UUID conversationId, UUID id);
+
+	/**
+	 * How many messages in each of the conversations someone other than {@code userId} sent: the unread count of a
+	 * member without a read position. Conversations without such messages are left out. Answered from the index on
+	 * {@code (conversation_id, sequence_number)}, which includes the sender.
+	 */
+	@Query("""
+			select new com.adonis.chattywap.message.dto.UnreadCountResponse(m.conversationId, count(*))
+			from Message m
+			where m.conversationId in :conversationIds and m.senderId <> :userId
+			group by m.conversationId
+			""")
+	List<UnreadCountResponse> countFromOthers(UUID userId, Collection<UUID> conversationIds);
 
 }

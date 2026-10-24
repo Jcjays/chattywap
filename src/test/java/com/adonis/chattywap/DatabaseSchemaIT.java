@@ -13,7 +13,10 @@ import org.springframework.test.context.ActiveProfiles;
 import javax.sql.DataSource;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -42,7 +45,7 @@ class DatabaseSchemaIT {
 		List<String> versions = jdbcTemplate.queryForList(
 				"select version from flyway_schema_history where success order by installed_rank", String.class);
 
-		assertThat(versions).contains("1", "2", "3", "4");
+		assertThat(versions).contains("1", "2", "3", "4", "5", "6", "7");
 	}
 
 	@Test
@@ -320,6 +323,110 @@ class DatabaseSchemaIT {
 	}
 
 	@Test
+	void sequenceNumbersArePositiveAndUniquePerConversation() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		UUID otherGroupId = insertGroup(userId, "Other");
+		insertMessage(groupId, userId, "First");
+		// Each conversation has its own numbers.
+		insertMessage(otherGroupId, userId, "First elsewhere");
+
+		assertThatThrownBy(() -> insertMessageNumbered(groupId, userId, 1))
+				.isInstanceOf(DuplicateKeyException.class)
+				.hasMessageContaining("messages_conversation_id_sequence_number_key");
+		for (long invalid : List.of(0L, -1L)) {
+			assertThatThrownBy(() -> insertMessageNumbered(groupId, userId, invalid))
+					.isInstanceOf(DataIntegrityViolationException.class)
+					.hasMessageContaining("messages_sequence_number_positive");
+		}
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into messages (id, conversation_id, sender_id, content, created_at)
+				values (?, ?, ?, 'Hello', now())
+				""", UUID.randomUUID(), groupId, userId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("sequence_number");
+	}
+
+	@Test
+	void aReceiptPositionBelongsToAMembershipAndNamesMessagesOfItsConversation() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID outsiderId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		UUID otherGroupId = insertGroup(userId, "Other");
+		insertMember(groupId, userId, "ADMIN");
+		insertMember(otherGroupId, userId, "ADMIN");
+		insertMessage(groupId, userId, "One");
+		insertMessage(otherGroupId, userId, "One");
+		insertMessage(otherGroupId, userId, "Two");
+
+		assertThatThrownBy(() -> insertReceiptPosition(groupId, outsiderId, 1, null))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_member_fkey");
+		// Message 2 exists, but in the other conversation.
+		assertThatThrownBy(() -> insertReceiptPosition(groupId, userId, 2, null))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_delivered_message_fkey");
+		// No message has number 0: a member without a read position has null.
+		assertThatThrownBy(() -> insertReceiptPosition(groupId, userId, 1, 0L))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_read_message_fkey");
+		insertReceiptPosition(groupId, userId, 1, 1L);
+		assertThatThrownBy(() -> insertReceiptPosition(groupId, userId, 1, 1L))
+				.isInstanceOf(DuplicateKeyException.class)
+				.hasMessageContaining("receipt_positions_pkey");
+	}
+
+	@Test
+	void aReadPositionIsNeverAheadOfTheDeliveredOneAndHasItsTime() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		insertMember(groupId, userId, "ADMIN");
+		insertMessage(groupId, userId, "One");
+		insertMessage(groupId, userId, "Two");
+
+		assertThatThrownBy(() -> insertReceiptPosition(groupId, userId, 1, 2L))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_read_not_after_delivered");
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into receipt_positions (conversation_id, user_id, last_delivered_sequence_number, delivered_at,
+				                               last_read_sequence_number)
+				values (?, ?, 2, now(), 1)
+				""", groupId, userId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_read_complete");
+		assertThatThrownBy(() -> jdbcTemplate.update("""
+				insert into receipt_positions (conversation_id, user_id, last_delivered_sequence_number, delivered_at,
+				                               read_at)
+				values (?, ?, 2, now(), now())
+				""", groupId, userId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("receipt_positions_read_complete");
+	}
+
+	@Test
+	void removingAMembershipRemovesItsReceiptPosition() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID otherUserId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+		insertMember(groupId, userId, "ADMIN");
+		insertMember(groupId, otherUserId, "MEMBER");
+		insertMessage(groupId, userId, "One");
+		insertReceiptPosition(groupId, userId, 1, 1L);
+		insertReceiptPosition(groupId, otherUserId, 1, null);
+
+		jdbcTemplate.update("delete from conversation_members where conversation_id = ? and user_id = ?", groupId,
+				otherUserId);
+
+		assertThat(count("select count(*) from receipt_positions where conversation_id = ? and user_id = ?", groupId,
+				otherUserId)).isZero();
+		assertThat(count("select count(*) from receipt_positions where conversation_id = ?", groupId)).isEqualTo(1);
+		// Messages that positions name can't be deleted: messages never are.
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from messages where conversation_id = ?", groupId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContainingAll("receipt_positions_", "_message_fkey");
+	}
+
+	@Test
 	void conversationsAndUsersWithMessagesCannotBeDeleted() {
 		UUID creatorId = insertUser(uniqueEmail());
 		// The database doesn't require senders to be members; that's the application's rule. A sender who
@@ -379,6 +486,62 @@ class DatabaseSchemaIT {
 		}
 	}
 
+	/**
+	 * Applies the migrations up to V5 to an empty schema, stores messages the way the application did before V6, then
+	 * applies V6: every conversation's messages are numbered from 1 in history order, which is by time, then by ID.
+	 */
+	@Test
+	void upgradingToV6NumbersExistingMessagesInHistoryOrder() {
+		String schema = "upgrade_" + UUID.randomUUID().toString().replace("-", "");
+		try {
+			migrate(schema, "5");
+			UUID userId = insertUser(schema, uniqueEmail());
+			UUID group = UUID.randomUUID();
+			UUID otherGroup = UUID.randomUUID();
+			jdbcTemplate.update("""
+					insert into %s.conversations (id, type, name, created_by, created_at, updated_at)
+					values (?, 'GROUP', 'Group', ?, now(), now()), (?, 'GROUP', 'Other', ?, now(), now())
+					""".formatted(schema), group, userId, otherGroup, userId);
+			// Inserted out of order, three of them at the same moment, which their IDs order.
+			List<Instant> times = List.of(Instant.parse("2026-01-01T10:00:03Z"), Instant.parse("2026-01-01T10:00:01Z"),
+					Instant.parse("2026-01-01T10:00:02Z"), Instant.parse("2026-01-01T10:00:02Z"),
+					Instant.parse("2026-01-01T10:00:02Z"));
+			List<Map.Entry<Instant, String>> inserted = new ArrayList<>();
+			for (Instant time : times) {
+				UUID id = UUID.randomUUID();
+				jdbcTemplate.update("""
+						insert into %s.messages (id, conversation_id, sender_id, content, created_at)
+						values (?, ?, ?, 'Hello', ?)
+						""".formatted(schema), id, group, userId, OffsetDateTime.ofInstant(time, ZoneOffset.UTC));
+				inserted.add(Map.entry(time, id.toString()));
+			}
+			UUID otherMessage = UUID.randomUUID();
+			jdbcTemplate.update("""
+					insert into %s.messages (id, conversation_id, sender_id, content, created_at)
+					values (?, ?, ?, 'Hello', now())
+					""".formatted(schema), otherMessage, otherGroup, userId);
+
+			migrate(schema, "6");
+
+			// PostgreSQL orders UUIDs like their lower-case text, which is how UUID.toString() writes them.
+			List<String> historyOrder = inserted.stream()
+					.sorted(Map.Entry.<Instant, String>comparingByKey().thenComparing(Map.Entry.comparingByValue()))
+					.map(Map.Entry::getValue)
+					.toList();
+			List<String> byNumber = jdbcTemplate.queryForList("select id::text from " + schema
+					+ ".messages where conversation_id = ? order by sequence_number", String.class, group);
+			assertThat(byNumber).containsExactlyElementsOf(historyOrder);
+			assertThat(jdbcTemplate.queryForList("select sequence_number from " + schema
+					+ ".messages where conversation_id = ? order by sequence_number", Long.class, group))
+					.containsExactly(1L, 2L, 3L, 4L, 5L);
+			assertThat(jdbcTemplate.queryForObject("select sequence_number from " + schema + ".messages where id = ?",
+					Long.class, otherMessage)).isEqualTo(1);
+		}
+		finally {
+			jdbcTemplate.execute("drop schema if exists " + schema + " cascade");
+		}
+	}
+
 	/** Applies the application's migrations up to {@code version} to {@code schema}, creating it if needed. */
 	private void migrate(String schema, String version) {
 		Flyway.configure()
@@ -424,12 +587,30 @@ class DatabaseSchemaIT {
 				""", UUID.randomUUID(), conversationId, userId, role);
 	}
 
+	private void insertMessageNumbered(UUID conversationId, UUID senderId, long sequenceNumber) {
+		jdbcTemplate.update("""
+				insert into messages (id, conversation_id, sequence_number, sender_id, content, created_at)
+				values (?, ?, ?, ?, 'Hello', now())
+				""", UUID.randomUUID(), conversationId, sequenceNumber, senderId);
+	}
+
+	/** {@code read} may be {@code null}: no read position. The times are set when a position is. */
+	private void insertReceiptPosition(UUID conversationId, UUID userId, long delivered, Long read) {
+		jdbcTemplate.update("""
+				insert into receipt_positions (conversation_id, user_id, last_delivered_sequence_number, delivered_at,
+				                               last_read_sequence_number, read_at)
+				values (?, ?, ?, now(), ?, case when ?::bigint is null then null else now() end)
+				""", conversationId, userId, delivered, read, read);
+	}
+
+	/** With the conversation's next sequence number, as the application assigns it. */
 	private UUID insertMessage(UUID conversationId, UUID senderId, String content) {
 		UUID id = UUID.randomUUID();
 		jdbcTemplate.update("""
-				insert into messages (id, conversation_id, sender_id, content, created_at)
-				values (?, ?, ?, ?, now())
-				""", id, conversationId, senderId, content);
+				insert into messages (id, conversation_id, sequence_number, sender_id, content, created_at)
+				values (?, ?, (select coalesce(max(sequence_number), 0) + 1 from messages where conversation_id = ?),
+				        ?, ?, now())
+				""", id, conversationId, conversationId, senderId, content);
 		return id;
 	}
 

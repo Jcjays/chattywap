@@ -84,7 +84,7 @@ curl http://localhost:8080/actuator/health
 ```
 
 - `db` is PostgreSQL, `rabbit` is RabbitMQ. You can query one component at a time, for example `/actuator/health/db`.
-- If a dependency is unavailable, its component and the overall status become `DOWN`, and the endpoint returns HTTP 503.
+- If a dependency is unavailable, its component and the overall status become `DOWN`, and the endpoint returns HTTP 503. Without RabbitMQ, the application still stores and delivers messages; only publishing their events waits (see [Asynchronous events](#asynchronous-events-rabbitmq-and-the-transactional-outbox)). The readiness probe, `/actuator/health/readiness`, doesn't depend on RabbitMQ.
 - Only the health endpoint is exposed over HTTP. It shows each component's status, never its details.
 
 ## Authentication
@@ -278,10 +278,10 @@ curl 'http://localhost:8080/api/v1/conversations?page=0&size=20' -H 'Authorizati
 ```
 
 ```json
-{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
+{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"unreadCount":2,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"unreadCount":0,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
 ```
 
-`nextCursor` is `null` here because the list has no more entries. See [Pagination](#pagination).
+`nextCursor` is `null` here because the list has no more entries. See [Pagination](#pagination). `unreadCount` is how many messages others sent that the caller hasn't read, the same number `GET /api/v1/conversations/{conversationId}/unread-count` reports (see [Receipts and unread counts](#delivery-and-read-receipts-unread-counts)).
 
 Get one conversation (same body as the creation responses):
 
@@ -420,7 +420,7 @@ Members of a conversation can post messages to it and read its history. Both end
 | `POST /api/v1/conversations/{conversationId}/messages` | `content` | `201` with the stored message |
 | `GET /api/v1/conversations/{conversationId}/messages?page=0&size=20` or `?size=20&cursor=...` | none | `200` with one page of the history, newest message first |
 
-Clients connected over WebSocket also receive new messages as they are sent, and can send them that way too; see [Real-time messaging](#real-time-messaging-websocket-and-stomp). These endpoints stay the way to read the history. Read receipts, unread counts, editing, deleting, reactions, attachments and search are not part of this API yet.
+Clients connected over WebSocket also receive new messages as they are sent, and can send them that way too; see [Real-time messaging](#real-time-messaging-websocket-and-stomp). These endpoints stay the way to read the history. Delivery and read receipts and unread counts have endpoints of their own (see [Delivery and read receipts, unread counts](#delivery-and-read-receipts-unread-counts)). Editing, deleting, reactions, attachments and search are not part of this API yet.
 
 ### Content
 
@@ -450,7 +450,7 @@ curl -i -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c
 ```
 
 ```json
-{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}
 ```
 
 Read the history:
@@ -460,9 +460,10 @@ curl 'http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8
 ```
 
 ```json
-{"content":[{"id":"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"content":"Me!","createdAt":"2026-10-24T10:31:12.654321Z"},{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
+{"content":[{"id":"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":2,"sender":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"content":"Me!","createdAt":"2026-10-24T10:31:12.654321Z"},{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
 ```
 
+- `sequenceNumber` is the message's position in its conversation: `1` for the first message, one more for each following one, without gaps, in the order the messages were stored. Receipts refer to messages by it.
 - `sender` is the sender's user ID and display name. Email addresses are never included.
 - `createdAt` is when the server stored the message: UTC, ISO 8601, in microseconds. A history entry is identical to the response that sending it returned.
 
@@ -499,11 +500,12 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 
 ### Design decisions
 
-- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. There is no strict per-conversation sequence number: storing and paging history don't need one, and real-time delivery doesn't add one either (see [Order and delivery](#order-and-delivery) and `ARCHITECTURE.md`, unresolved decision 9).
+- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. The history keeps this order (see [Order and delivery](#order-and-delivery) and `ARCHITECTURE.md`, unresolved decision 9).
+- **Sequence numbers.** Every message also gets the next number of its conversation, read under the same conversation lock, so the numbers follow the order in which messages were stored on any number of instances, whatever their clocks say. A send that fails uses up no number, and messages are never deleted, so a conversation's numbers have no gaps. Receipts are positions in this order. A unique constraint on `(conversation_id, sequence_number)` catches a number given twice; its index, which includes the sender, also answers "the highest number" and unread counts. Existing messages were numbered in history order by migration V6.
 - **Membership checked under the conversation lock.** Sending takes the conversation lock that every group change takes, after checking that the sender is a member, checks the membership again under the lock, stores the message and moves the conversation's `updatedAt` to the message's time, all in one transaction. Leaving, removal and group deletion wait for a message that is being sent, and a message sent while one of them is in progress waits for it and is then rejected. Taking the conversation lock first, like every group change, also means sends and group changes can't deadlock. Reading the history takes no lock: a read at the same moment as a removal sees the membership from before or after it.
 - **Conversation activity.** Sending a message moves the conversation's `updatedAt`, its activity time, to the message's `createdAt`, so the conversation moves to the top of its members' lists. The update is part of the message's transaction: if storing the message fails, `updatedAt` keeps its old value. `updatedAt` is reused rather than adding a separate field, so the conversation list's order, cursors and JSON stay as they were; `updatedAt` simply also counts messages as activity now. It has no index, so updating it on every message touches no index.
 - **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Only after the commit is the message delivered to connected members (see [Real-time messaging](#real-time-messaging-websocket-and-stomp)), so a message that couldn't be stored is never delivered.
-- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes seven statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, sender, insert, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
+- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes nine statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, the conversation's highest sequence number, sender, insert, its outbox event, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
 - **Pagination in the database.** Pages use `FETCH FIRST`, and `OFFSET` for page numbers. A page by cursor selects the messages that sort after the cursor with a row comparison, `(created_at, id) < (t, i)`, which PostgreSQL uses as the start of the index scan. The equivalent `created_at < t or (created_at = t and id < i)` filters every newer message instead.
 - **Indexes.** One new index, `messages (conversation_id, created_at, id)`. PostgreSQL reads it backwards for the newest-first order, so pages need no sort. Checked against 1,000,000 messages, 200,000 of them in one conversation: the first page and a cursor page 100,000 messages deep each read a handful of index pages in under 0.1 ms. Membership checks use the existing membership indexes. There is no index on `sender_id`: nothing looks messages up by sender, and users can't be deleted, so it would only slow down inserts.
 - **Database constraints.** Foreign keys to the conversation and the sender (`on delete restrict`: a conversation or a user with messages can't be deleted; nothing in the application deletes either); `content` is `varchar(4000)` and can't be empty or only ASCII whitespace. The API's checks are stricter, so the database constraints only catch bugs.
@@ -528,6 +530,7 @@ The WebSocket only delivers messages sent while a client is connected. The histo
 | Authenticate | `Authorization: Bearer <accessToken>` header in the STOMP `CONNECT` frame |
 | Send a message | `SEND` to `/app/conversations/{conversationId}/messages`, body `{"content": "..."}` |
 | Receive a conversation's messages | `SUBSCRIBE` to `/topic/conversations/{conversationId}/messages` |
+| Receive changes of a conversation's delivery and read receipts | `SUBSCRIBE` to `/topic/conversations/{conversationId}/receipts` (see [Receipts](#delivery-and-read-receipts-unread-counts)) |
 | Receive the errors of your own messages | `SUBSCRIBE` to `/user/queue/errors` |
 
 In the frame examples below, `^@` stands for the NUL byte that ends every STOMP frame.
@@ -584,16 +587,16 @@ destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages
 content-type:application/json
 subscription:sub-0
 message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-0
-content-length:256
+content-length:275
 
-{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}^@
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}^@
 ```
 
 Messages sent through REST and through STOMP arrive the same way, once each. The sender receives its own messages too, if it is subscribed.
 
 - **Only members can subscribe**, decided in the database at the moment of subscribing. A conversation the user isn't a member of, an unknown ID and a deleted group all get the same `ERROR` frame (`404`, `Conversation not found.`), and the server closes the connection. STOMP has no way to reject one subscription and keep the connection. Clients should subscribe only to conversations from their current list; to tell which subscription failed, add a `receipt` header to each `SUBSCRIBE`, which the `ERROR` frame repeats as `receipt-id`.
 - **Losing membership ends delivery.** A member who leaves or is removed keeps the subscription, but receives none of the messages sent after that, and subscribing again is rejected. Nobody is told; the client sees the change in the conversation list.
-- **Only these destinations** can be subscribed to. Patterns (`/topic/conversations/*/messages`), other users' queues and conversation IDs not written exactly as the API returns them (lower case, with hyphens) are rejected with `404` (`Unknown destination.`), and the connection is closed.
+- **Only these destinations** can be subscribed to, and a conversation's receipts topic under the same rules (see [Real-time receipt changes](#real-time-receipt-changes)). Patterns (`/topic/conversations/*/messages`), other users' queues and conversation IDs not written exactly as the API returns them (lower case, with hyphens) are rejected with `404` (`Unknown destination.`), and the connection is closed.
 - New conversations aren't announced over the WebSocket. A client subscribes to a conversation after creating it, or after it appears in the conversation list.
 
 ### Sending
@@ -675,8 +678,8 @@ Stopping at a known `id` relies on history order matching the order in which mes
 
 - **Authentication in the CONNECT frame, not the handshake.** STOMP clients can set `CONNECT` headers everywhere, also where they can't set HTTP headers on the WebSocket handshake (browsers). The handshake (`GET /ws`) is therefore public; every other HTTP rule is unchanged, so all other paths, including other methods on `/ws`, still need an access token. A connection can do nothing before its `CONNECT` is accepted, and Spring closes connections that send no frame within a minute. The token is validated by Spring Security's JWT authentication provider with the application's `JwtDecoder`, the same as for REST, and removed from the `CONNECT` frame afterwards so it isn't passed on.
 - **Deny by default.** An interceptor (`realtime.StompSecurityInterceptor`) checks every frame before any handler or the broker sees it: which commands, which destinations, whose token. The decisions themselves stay with the services: `ConversationService.requireMembership` decides subscriptions, and `MessageService` decides sends, exactly as for REST.
-- **Recipients are fixed when the message is stored.** Sending reads the conversation's members under the conversation lock that every send and membership change takes, and publishes them with the message. Delivery goes only to their connections: a subscription that outlived its user's membership receives nothing. A member removed after the message was stored still receives it, as they could still read it in the history at that moment. Reading the members adds one statement to every send (seven in all).
-- **Delivered after the commit, from one place.** `MessageService` publishes a `MessageSentEvent` for every stored message. `realtime.MessageBroadcaster` delivers it once the transaction has committed (`@TransactionalEventListener`), so REST and STOMP sends share one path and nothing is delivered twice or before it exists. If delivery fails, the message stays stored and the send still succeeds; the failure is logged. There is no transactional outbox yet: a message whose delivery is lost (for example because the application stops right after the commit) is only in the history.
+- **Recipients are fixed when the message is stored.** Sending reads the conversation's members under the conversation lock that every send and membership change takes, and publishes them with the message. Delivery goes only to their connections: a subscription that outlived its user's membership receives nothing. A member removed after the message was stored still receives it, as they could still read it in the history at that moment. Reading the members adds one statement to every send (eight in all, with the outbox event).
+- **Delivered after the commit, from one place.** `MessageService` publishes a `MessageSentEvent` for every stored message. `realtime.MessageBroadcaster` delivers it once the transaction has committed (`@TransactionalEventListener`), so REST and STOMP sends share one path and nothing is delivered twice or before it exists. If delivery fails, the message stays stored and the send still succeeds; the failure is logged. WebSocket delivery deliberately doesn't go through the transactional outbox or RabbitMQ (see [Asynchronous events](#asynchronous-events-rabbitmq-and-the-transactional-outbox)): it stays immediate and works while RabbitMQ is down, and a message whose delivery is lost (for example because the application stops right after the commit) is only in the history. Its `MessageCreated` event, which is durable, isn't delivered over WebSocket again.
 - **Order kept per connection.** Frames from one connection are processed in order, and messages to one connection are sent in the order they were published (Spring's `preserveReceiveOrder` and `preservePublishOrder`). Without that, Spring processes a connection's frames in parallel, and two messages sent in a row could be stored in the opposite order. The cost: one connection's frames wait for each other. Because Spring's ordering only logs exceptions thrown while checking a frame, the interceptor sends its `ERROR` frames itself.
 - **Errors as problem details.** `ERROR` frames and error-queue messages use the same format, statuses and messages as REST errors, so clients handle both alike.
 
@@ -689,6 +692,341 @@ Stopping at a known `id` relies on history order matching the order in which mes
 - New conversations, membership changes and deleted groups aren't announced over the WebSocket.
 - Delivery order across senders can differ from the history order (see [Order and delivery](#order-and-delivery)).
 - No STOMP heartbeats from the server.
+
+## Delivery and read receipts, unread counts
+
+Members tell the server which messages their client has received and which they have read. Other members see it, live over the WebSocket and through REST, and every member can ask how many messages they haven't read. All endpoints require an access token; the member who acknowledges is always the user in the token.
+
+### What sent, delivered and read mean
+
+| Status of a message, for one member | Meaning | Recorded by |
+|---|---|---|
+| **Sent** | The message is stored in PostgreSQL: `POST .../messages` answered `201`, or it arrived over the WebSocket, which only happens after it was stored. | The server, when it stores the message |
+| **Delivered** | The member's client acknowledged that it received the message. | `POST .../receipts/delivered` from that member |
+| **Read** | The member reported reading the message. | `POST .../receipts/read` from that member |
+
+- Nothing else makes a message delivered: not a WebSocket broadcast, an open connection, a subscription, or the message's event reaching RabbitMQ. A client that received a message but never acknowledged it hasn't had it delivered, as far as the server knows.
+- Delivered never counts as read. Read does count as delivered: a member can only read what their client received, so reporting a read also acknowledges delivery up to the same message.
+- **Per member.** In a group, each member has their own positions. One member's acknowledgement says nothing about the others: "read by Bob" isn't "read by everyone".
+- The sender's own messages are never unread for the sender.
+
+### Positions
+
+Each member has two positions in a conversation: `lastDeliveredSequenceNumber` and `lastReadSequenceNumber`. They are message sequence numbers (`sequenceNumber` in every message), `0` if the member hasn't acknowledged anything. An acknowledgement names one message and covers it **and every earlier message** of the conversation, the member's own included, the way a read marker does.
+
+So for a message with sequence number `n` and a member `m`:
+
+- read by `m` if `n <= m.lastReadSequenceNumber`,
+- otherwise delivered to `m` if `n <= m.lastDeliveredSequenceNumber`,
+- otherwise only sent.
+
+Positions only move forward. Acknowledging the same message again, or an earlier one, changes nothing: the answer is `200` with the position as it is, and nobody is notified. Retries, duplicates and requests that arrive out of order are therefore harmless, also when they run at the same moment.
+
+### Endpoints
+
+| Method and path | Body | Success |
+|---|---|---|
+| `POST /api/v1/conversations/{conversationId}/receipts/delivered` | `messageId` | `200` with the caller's position |
+| `POST /api/v1/conversations/{conversationId}/receipts/read` | `messageId` | `200` with the caller's position |
+| `GET /api/v1/conversations/{conversationId}/receipts` | none | `200` with every member's position |
+| `GET /api/v1/conversations/{conversationId}/unread-count` | none | `200` with the caller's unread count |
+
+The conversation list (`GET /api/v1/conversations`) also has each entry's `unreadCount`.
+
+Acknowledge receiving everything up to a message:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts/delivered -H 'Authorization: Bearer <accessToken>' -H 'Content-Type: application/json' -d '{"messageId": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"}'
+```
+
+```json
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:31:13.000123Z","lastReadSequenceNumber":0,"readAt":null}
+```
+
+Report reading up to a message (`POST .../receipts/read`, same body): the answer has `lastReadSequenceNumber` `2` and `lastDeliveredSequenceNumber` at least `2`.
+
+Every member's positions:
+
+```bash
+curl http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts -H 'Authorization: Bearer <accessToken>'
+```
+
+```json
+{"members":[{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:31:20.000456Z","lastReadSequenceNumber":2,"readAt":"2026-10-24T10:31:20.000456Z"},{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","lastDeliveredSequenceNumber":0,"deliveredAt":null,"lastReadSequenceNumber":0,"readAt":null}]}
+```
+
+The caller's unread count:
+
+```bash
+curl http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/unread-count -H 'Authorization: Bearer <accessToken>'
+```
+
+```json
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","unreadCount":3}
+```
+
+| Field | Meaning |
+|---|---|
+| `lastDeliveredSequenceNumber`, `lastReadSequenceNumber` | The last message the member acknowledged as received or read, with every message before it; `0` for none. The read position is never ahead of the delivered one. |
+| `deliveredAt`, `readAt` | When that position last moved forward, in microseconds; `null` if it never did. Never earlier than the time before, and `readAt` never earlier than the delivered time when it moved (an acknowledgement that waited for a concurrent one gets at least that one's time). |
+| `members` | Every current member, the caller included, ordered by user ID; members who haven't acknowledged anything have `0` and `null` |
+| `unreadCount` | Messages others sent after the caller's read position (see [Unread counts](#unread-counts)) |
+
+### When clients acknowledge
+
+- **Delivered**: after receiving messages, live or from the history, acknowledge the newest message up to which the client has **every** message. Sequence numbers start at `1` and have no gaps, so the client can tell: holding `1` to `7` and `9`, it acknowledges `7` and loads `8` from the history. One acknowledgement covers all earlier messages, so acknowledge once per burst (for example at most once a second), not once per message.
+- **Read**: when the user has seen messages, acknowledge the newest one on screen.
+- On a network error, send the same acknowledgement again: it's safe.
+- Only acknowledge what the client really has or the user really saw; the server can't check it.
+
+### Who can do what
+
+| Endpoint | Allowed for | Otherwise |
+|---|---|---|
+| Acknowledge delivered or read | Members of the conversation, for themselves | `404` (`Conversation not found.`) for non-members, former members, deleted groups and unknown conversations; `404` (`Message not found.`) if the message isn't one of the conversation's |
+| List receipts | Members of the conversation | `404` (`Conversation not found.`) |
+| Unread count | Members of the conversation | `404` (`Conversation not found.`) |
+
+- The member is always the token's user. A `userId` in the body or the query string is ignored: nobody can acknowledge for someone else or move someone else's position.
+- Membership is checked before the message, so non-members learn nothing about messages, not even whether an ID exists. A message of another conversation, even one the caller belongs to, gets the same `404` as an unknown ID.
+- **Every member sees every member's positions**, in direct conversations and groups alike: in a direct conversation, the sender sees that the other participant read their messages; in a group, who has read up to where. Positions show only user IDs, sequence numbers and times. Non-members see nothing.
+- A member who leaves or is removed loses their positions with the membership. Joining again starts without positions.
+
+### Unread counts
+
+A member's unread messages are the messages of the conversation that:
+
+1. someone else sent (the member's own never count), and
+2. come after the member's read position, by sequence number. A member who has never reported reading anything has no read position, so **every message others sent counts**, including messages sent before they joined.
+
+Acknowledging delivery doesn't change the count; only reading does. Counts are computed from PostgreSQL on every request, never stored, so they can't drift from the messages and positions, whatever order messages and read updates arrive in. The conversation list computes them the same way, two statements for a whole page, so its `unreadCount`s always agree with `GET .../unread-count`.
+
+Unread counts aren't pushed over the WebSocket. A client keeps its badge current from what it receives: a message from someone else with a sequence number after its read position adds one; a change of its own read position (from another device) is a reason to recompute or to call `GET .../unread-count`. After reconnecting, the REST counts are the truth.
+
+### Real-time receipt changes
+
+Subscribe to a conversation's receipts like to its messages, as a member:
+
+```
+SUBSCRIBE
+id:sub-1
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts
+
+^@
+```
+
+Whenever a member's delivered or read position moves forward, the connected members receive the member's new position, the same JSON as the REST answer:
+
+```
+MESSAGE
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts
+content-type:application/json
+subscription:sub-1
+message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-2
+content-length:247
+
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:32:00.000789Z","lastReadSequenceNumber":2,"readAt":"2026-10-24T10:32:00.000789Z"}^@
+```
+
+- **Stored, then delivered.** A change is delivered after its transaction committed. One that couldn't be stored is never delivered.
+- **Only changes.** Repeated and outdated acknowledgements change nothing and deliver nothing. Each frame is the member's whole position, and positions only move forward: a client keeps the furthest it has seen per member, whatever order frames arrive in.
+- **Only current members** receive changes, the acknowledging member's own connections included, so their other devices learn of it. Members who left or were removed keep their subscription but receive nothing more, and subscribing again is rejected. The one exception: a change that commits at the same moment as a member's removal can still reach that member, because acknowledgements don't take the conversation lock. Every message it covers was sent before the removal. Non-members, unknown conversations and deleted groups get the same `ERROR` frame (`404`) as for the messages topic; patterns and other spellings of the ID get `404` (`Unknown destination.`).
+- **Best effort**, like messages: nothing is retried, and a client that wasn't connected catches up through REST.
+- Acknowledgements are sent through REST only, not as STOMP `SEND`s.
+
+### Reconnecting
+
+After connecting again (see [Missed messages and reconnecting](#missed-messages-and-reconnecting) for messages):
+
+1. Subscribe to each shown conversation's `messages` and `receipts` topics, then catch up the history.
+2. Load `GET .../receipts` for the conversations on screen, and the conversation list (or `GET .../unread-count`) for unread counts. Changes that arrive live meanwhile are merged by keeping each member's furthest position.
+3. Acknowledge delivery up to the newest message the client now has without gaps, and reading if the user sees the conversation.
+
+### Errors
+
+| Situation | Status | Notes |
+|---|---|---|
+| Missing or `null` `messageId` | `400` | `errors` lists `messageId` |
+| Malformed JSON, a malformed message ID or conversation ID | `400` | Rejected values are never echoed |
+| Missing, malformed, expired or wrongly signed access token | `401` | |
+| Conversation doesn't exist, was deleted, or the caller isn't (or is no longer) a member | `404` | `Conversation not found.`, identical in all cases |
+| The message doesn't exist or belongs to another conversation | `404` | `Message not found.`, identical in both cases |
+| Acknowledging a message at or before the current position | `200` | Not an error: the position is returned unchanged |
+| Unexpected server error, including a failure to store the position | `500` | Generic message. Nothing is stored or delivered. |
+
+### Design decisions
+
+- **Positions, not rows per message.** A member's receipts are two numbers per conversation, one row in `receipt_positions`, written only when they move. One row per message and recipient would mean up to 99 rows for every message in a full group, written whether or not anybody reads, and a cleanup. The price: a position can't say "received message 9 but not 8". Clients acknowledge only up to where they have everything, which sequence numbers without gaps make possible.
+- **Sequence numbers, not times.** Positions compare sequence numbers, which follow the order in which messages were stored on any number of instances. A position by time could be passed by a message that is stored later with an earlier time (application instances with different clocks), which would then never count as unread.
+- **Forward only, in one statement.** Each acknowledgement is one `insert ... on conflict do update ... where` statement that only moves the position forward. Concurrent acknowledgements of one member wait for each other's row lock, and the furthest wins whatever order they commit in. Acknowledgements take no conversation lock, so they never wait for messages being sent.
+- **Synchronous, without RabbitMQ.** The position is stored before the request returns, in a short transaction. Nothing consumes receipt changes asynchronously, so they produce no outbox event: an event with no queue for it would be returned by RabbitMQ and retried by the relay forever. Real-time delivery uses the same after-commit path as messages.
+- **Membership changes.** Membership is checked without a lock; a member removed at the same moment fails on the position's foreign key to the membership and gets the same `404` as any non-member. The same foreign key deletes positions with their membership.
+- **Counted, not stored.** Unread counts are counted when asked, from the index on `(conversation_id, sequence_number)`, which includes the sender: PostgreSQL reads only the index, and with a read position only the entries after it. A stored counter would have to be kept right through concurrent messages, reads, retries and membership changes, and reconciled when it isn't.
+- **Database constraints.** Positions must belong to a membership (cascade on delete) and name messages of the same conversation (foreign keys on the sequence number); the read position can't be ahead of the delivered one; a read position and its time come together.
+
+### Known limitations
+
+- **Without a read position, counting reads the whole history**: every message others sent counts, and PostgreSQL counts them in the index. Measured with 1,000,000 messages: with a read position, a count reads the unread entries only (0.1 ms); without one, about 35 ms for a conversation of 200,000 messages, and a conversation-list page of 100 conversations with 2,000 messages each and no read positions takes about 70–100 ms. Counts aren't capped.
+- **After upgrading, nobody has a read position**: all existing messages from others count as unread until members report reading. The migration doesn't mark them read, because that would show read receipts for messages nobody read.
+- **Members added to a group see its whole history as unread**, as they can read all of it.
+- **Visible to all members, no opt-out.** Every member sees every member's positions; members can't turn read receipts off.
+- **Fan-out in groups.** Every change goes to every connected member: in a group of 100, up to 100 frames per acknowledgement. Clients should batch delivery acknowledgements.
+- **One application instance** for live changes, like messages (see [Order and delivery](#order-and-delivery)).
+- **Unread counts aren't pushed**; clients derive them from what they receive (see [Unread counts](#unread-counts)).
+- **The server trusts the client's acknowledgements**: it can't check that a client really has the messages it acknowledges.
+- **Removal races.** A receipt change committing at the moment a member is removed can reach that member once; an acknowledgement in flight while a member is removed and added back lands in the new membership, which then doesn't start without a position. Both need the request and the membership change within milliseconds of each other.
+
+## Asynchronous events (RabbitMQ and the transactional outbox)
+
+Every stored message also produces a durable `MessageCreated` event, published to RabbitMQ for asynchronous consumers such as push notifications or analytics in later milestones. Unread counts don't need it: they are counted in PostgreSQL. Receipt changes produce no event (see [Design decisions](#design-decisions-3)). PostgreSQL stays the source of truth for messages and conversations; RabbitMQ carries events and is never read as message history.
+
+The event is written to an outbox table in the same transaction as the message, and a relay publishes it to RabbitMQ after the commit. Sending a message never waits for RabbitMQ and works while it is down.
+
+### WebSocket delivery and durable events
+
+The two paths are independent. Both start from the same stored message, and neither repeats the other.
+
+| | WebSocket delivery | `MessageCreated` event |
+|---|---|---|
+| Receivers | Members connected to this instance | RabbitMQ consumers |
+| When | Right after the commit, in the sending thread | When the relay has published it, normally within a second |
+| Guarantee | At most once, best effort; not retried | At least once; retried until published |
+| Needs RabbitMQ | No | Yes, but storing the message doesn't wait for it |
+| If the application stops right after the commit | The live delivery is lost; the history has the message | Nothing is lost: the event is in the outbox |
+
+The example consumer of `MessageCreated` events doesn't deliver anything over WebSocket.
+
+### The `MessageCreated` event
+
+Version 1, `messaging.dto.MessageCreatedEvent`, published to the exchange `chattywap.events` with routing key `message.created`. The body is JSON, serialized like the REST API's JSON:
+
+```json
+{"eventId":"4e1f2a3b-5c6d-4e7f-8a9b-0c1d2e3f4a5b","eventType":"MessageCreated","eventVersion":1,"occurredAt":"2026-10-24T10:30:00.123456Z","messageId":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","senderId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11"}
+```
+
+| Field | Meaning |
+|---|---|
+| `eventId` | Unique per event, the same in every delivery of it. Consumers deduplicate by it. |
+| `eventType`, `eventVersion` | `MessageCreated`, `1` |
+| `occurredAt` | When the message was stored: its `createdAt` |
+| `messageId`, `conversationId`, `senderId` | The stored message, its conversation and its sender |
+
+- The event never contains the message's content, the sender's name or email address, or tokens. Consumers that need more read it through the owning feature.
+- AMQP properties: `message_id` is the `eventId`, `type` is `MessageCreated`, `content_type` is `application/json`, and the message is persistent.
+- Compatible changes (new optional fields) keep the version; consumers ignore fields they don't know. Removing, renaming or changing the meaning of a field is a new version. A consumer rejects versions and types it doesn't know, to its dead-letter queue.
+
+### Exchanges and queues
+
+The application declares these when it connects to RabbitMQ, and again after every reconnect.
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `chattywap.events` | Topic exchange, durable | All application events. The routing key names the event: `message.created`. |
+| `chattywap.message-counts` | Quorum queue, durable | The example consumer's queue, bound to `message.created`. Rejected messages, and messages delivered 10 times without being acknowledged, go to `chattywap.events.dead-letter`. |
+| `chattywap.events.dead-letter` | Direct exchange, durable | Receives the messages consumers rejected, with their queue's name as routing key. |
+| `chattywap.message-counts.dead-letter` | Quorum queue, durable | Dead letters of the example consumer, kept for investigation. Nothing consumes it. |
+
+Queue arguments can't change on an existing queue. Changing them needs a new queue name, or deleting the queue first (`docker compose down -v` locally).
+
+### Outbox lifecycle
+
+1. **Write.** `MessageService.sendMessage` stores the message. Still in its transaction, `messaging.OutboxWriter` inserts the event into `outbox_events`, pending: `published_at` empty, `attempts` 0, due at once. The message, its event and the conversation's activity time commit together. If any of them fails, all roll back, and no event exists for a message that wasn't stored.
+2. **Claim.** Every `poll-interval` (1 second), `messaging.OutboxRelay` claims up to `batch-size` (100) due events in one short statement. The claim counts the attempt and reserves the events for the `lease` (60 seconds). Rows other relays are claiming at that moment are skipped (`for update skip locked`), so several application instances never claim the same event at the same time. No lock or transaction is held from here on.
+3. **Publish.** The relay publishes each event and waits up to `confirm-timeout` (10 seconds) for RabbitMQ's publisher confirms.
+4. **Record.** Events RabbitMQ acknowledged and didn't return get `published_at`. Every other outcome is a failed attempt: a negative acknowledgement, a returned message (no queue is bound to its routing key), no confirmation in time, or a broker that can't be reached. The event stays pending with the error in `last_error`, and is due again after a delay of 1 second, doubled after every further failure, up to 5 minutes. Events are retried until they are published; none is dropped.
+
+A batch always ends before its lease, so no other relay claims its events while it still works on them: sending stops at the first failed send (the rest of the batch would wait and fail the same way) and once only the confirm timeout is left of the lease; the events not sent are failed attempts. A relay whose lease expired anyway (a long pause) can't record a failure for an event another relay has claimed since. A run continues with the next batch as long as batches are full. The relay publishes on a connection of its own, so a broker that blocks publishers (memory or disk alarm) doesn't block consumers. Published rows are kept; nothing deletes them yet.
+
+### Consumers, retries and idempotency
+
+The example consumer, `messaging.MessageCountConsumer`, counts the `MessageCreated` events of each conversation in `conversation_message_counts`. It's the smallest effect that shows whether processing is reliable: a duplicate applied twice would make a count too high. Nothing in the API reads it.
+
+- **Acknowledgement.** The listener container acknowledges a message after the listener returned, so after the consumer's transaction committed (`acknowledge-mode: auto`). If the listener throws, the message is rejected and never requeued (`default-requeue-rejected: false`).
+- **Retries.** Failures are retried inside the listener, with backoff: 4 attempts in all, 1, 2 and 4 seconds apart. Invalid events (unreadable JSON, missing fields, another type or version), data the database rejects (an unknown conversation) and other failures that would repeat aren't retried.
+- **Dead-lettering.** After the last attempt, or at once for those failures, the message is rejected and RabbitMQ moves it to the consumer's dead-letter queue, at least once: the queue keeps it until the dead-letter queue has accepted it. The application logs the event ID and the cause, never the body. A message that crashes the application before it can be rejected is dead-lettered by RabbitMQ after 10 deliveries.
+- **Idempotency.** In the transaction of its effect, the consumer inserts `(consumer_name, event_id)` into `processed_events` with `on conflict do nothing`. If the row already exists, the event was processed before, and nothing changes. The record and the effect commit together, so a crash between them leaves neither, and the redelivered event is processed normally.
+
+**Why an event can arrive twice.** Publishing and recording the publication are two steps on two systems. If the relay stops, or PostgreSQL fails, after RabbitMQ confirmed an event but before `published_at` is set, the event stays pending and is published again once its lease expires. A confirmation that arrives after the timeout has the same result. RabbitMQ also redelivers a message whose consumer stopped before acknowledging it. Delivery is therefore **at least once**, not exactly once. Deduplicating by `eventId` in the consumer's own transaction makes the effect in PostgreSQL happen once per event however often it's delivered. Effects outside PostgreSQL (an email, a push notification) can't be made exactly once this way; such consumers must tolerate duplicates themselves.
+
+### Failure behavior
+
+| Situation | What happens |
+|---|---|
+| The message's transaction fails | The message and its event both roll back. Nothing is published. |
+| RabbitMQ is down | Sending (REST and STOMP), the history and WebSocket delivery keep working. Events stay pending; the relay retries with growing delays (at most 5 minutes apart) and publishes them once RabbitMQ is back. `/actuator/health` reports `rabbit` and the overall status `DOWN` (`503`) meanwhile; the readiness probe (`/actuator/health/readiness`) doesn't include RabbitMQ, so use it to decide whether an instance takes requests. |
+| The application stops while publishing | Claimed events are due again when their lease expires, and every instance may publish them. Events RabbitMQ had already accepted are published a second time. |
+| The consumer stops before acknowledging | RabbitMQ delivers the message again. The deduplication makes that harmless. |
+| A transient failure while processing | Retried in the listener, then processed. |
+| A poison message | Dead-lettered after its retries, or at once if it's invalid. The queue isn't blocked. |
+| Shutdown | The relay starts no new batch and finishes the current one (waiting up to the lease), so it doesn't stop between a confirmation and recording it. The listener container finishes the message in progress; unacknowledged messages are redelivered after the restart. |
+
+### Configuration
+
+The connection uses the `RABBITMQ_*` variables from [Configure the local environment](#configure-the-local-environment). The relay's settings, in `application.yaml`, can be overridden like any Spring property, for example `CHATTYWAP_MESSAGING_OUTBOX_POLLINTERVAL=5s`:
+
+| Property | Default | Meaning |
+|---|---|---|
+| `chattywap.messaging.outbox.relay-enabled` | `true` | Whether this instance publishes outbox events. Events are still written when it's off. |
+| `chattywap.messaging.outbox.poll-interval` | `1s` | Pause between two runs of the relay |
+| `chattywap.messaging.outbox.batch-size` | `100` | Events claimed and published together (1 to 1000) |
+| `chattywap.messaging.outbox.confirm-timeout` | `10s` | How long to wait for RabbitMQ to confirm a batch |
+| `chattywap.messaging.outbox.lease` | `60s` | How long a claimed event is reserved. Must be longer than `confirm-timeout`. |
+| `chattywap.messaging.outbox.initial-retry-delay`, `max-retry-delay` | `1s`, `5m` | Delay after the first failed attempt, and its maximum |
+| `spring.rabbitmq.listener.simple.retry.*` | 3 retries, 1s, ×2, at most 10s | Consumer retries |
+| `spring.rabbitmq.connection-timeout` | `5s` | How long to wait for an unreachable broker |
+
+Publisher confirms (`publisher-confirm-type: correlated`), returns and mandatory publishing are required by the relay; don't turn them off.
+
+### Logs and metrics
+
+The relay and the consumer log event IDs, never event bodies: each failed attempt at `WARN` (with the reason and the next delay), each dead-lettered message at `ERROR`. Published and processed events are logged at `DEBUG`.
+
+| Metric | Meaning |
+|---|---|
+| `chattywap.outbox.pending` | Events not published yet (read from the database) |
+| `chattywap.outbox.oldest.pending.age` | Age in seconds of the oldest event not published yet; 0 if there is none |
+| `chattywap.outbox.published` | Events RabbitMQ confirmed |
+| `chattywap.outbox.failed` | Failed publication attempts, by `reason`: `nack`, `returned`, `timeout`, `unreachable`, `send-error`, `out-of-time` |
+| `chattywap.outbox.retried` | Attempts for events that had been claimed before |
+| `chattywap.events.consumed` | Events processed, by `outcome`: `processed`, or `duplicate` when skipped |
+| `chattywap.events.consumer.failures` | Failed processing attempts, retries included |
+| `chattywap.events.dead.lettered` | Messages this application dead-lettered, by `queue` |
+
+Only the health endpoint is exposed over HTTP. To read metrics locally, start the application with `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,metrics` and call `/actuator/metrics/chattywap.outbox.pending` with an access token.
+
+### Troubleshooting
+
+Events that aren't published yet, oldest first, with their last error:
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select id, event_type, attempts, next_attempt_at, last_error, created_at from outbox_events where published_at is null order by created_at limit 50"'
+```
+
+The event of a message, and whether the example consumer processed it (`select * from processed_events where event_id = '<eventId>'`):
+
+```sql
+select id, published_at, attempts, last_error from outbox_events where payload::jsonb ->> 'messageId' = '<messageId>';
+```
+
+To retry a pending event now instead of waiting for its delay: `update outbox_events set next_attempt_at = now() where id = '<eventId>' and published_at is null;`
+
+Queues and their depths:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name type messages messages_unacknowledged
+```
+
+Dead letters: open the management UI (<http://localhost:15672>), *Queues and Streams* → `chattywap.message-counts.dead-letter` → *Get messages*. The message ID is the event ID; the `x-first-death-reason` header says why it was dead-lettered (`rejected`: by the consumer, `delivery_limit`: too many redeliveries) and `x-first-death-queue` where from. The consumer's log line for that event ID has the cause. After fixing the cause, the simplest replay goes through the outbox, which keeps every event: `update outbox_events set published_at = null, next_attempt_at = now() where id = '<eventId>';` republishes it, and consumers that processed it already skip it. Then purge the dead letter.
+
+### Known limitations
+
+- **At least once, not exactly once.** Consumers must deduplicate (see above). The example consumer does, in PostgreSQL.
+- **No order.** Retries and several relays publish events in any order. Consumers that need order must use `occurredAt` or read the current state.
+- **Tables grow without bound.** Published `outbox_events` and `processed_events` rows are never deleted. The relay's queries use a partial index of pending events, so the growth doesn't slow them down, but a cleanup is needed eventually. It must keep `processed_events` longer than an event can still be redelivered or replayed.
+- **Unroutable events are retried indefinitely**, every 5 minutes at most, for example after a binding was removed by mistake. `chattywap.outbox.failed{reason=returned}` and `last_error` show it.
+- **Retries hold the consumer.** Retry delays run inside the listener, so a failing message delays the messages behind it by up to 7 seconds before it is dead-lettered.
+- **Dead letters aren't replayed automatically**, and nothing alerts on them besides the metric and the log.
+- **One RabbitMQ node** in Compose: the quorum queues have no replicas there.
 
 ## Run tests
 
@@ -719,17 +1057,28 @@ To run only the authentication tests:
 | `AuthControllerIT` | Registration, email normalization, duplicate emails (also concurrent), validation errors, login, identical errors for wrong password and unknown email |
 | `RefreshTokenIT` | Rotation, hash-only storage, reuse detection, concurrent refreshes, expired and unknown tokens, logout behavior |
 | `UserControllerIT` | `/api/v1/users/me` with valid, missing, malformed, expired, wrongly signed, wrong-issuer and wrong-audience tokens |
-| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3; message foreign keys, blank and too long content, conversations and users with messages can't be deleted |
+| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3; message foreign keys, blank and too long content, conversations and users with messages can't be deleted; positive sequence numbers unique per conversation; upgrading a V5 database to V6 numbers existing messages in history order; receipt positions belong to a membership (removed with it) and name messages of their own conversation, read never ahead of delivered |
 | `DirectPairTest` (unit) | Ordering of a direct conversation's participants the way PostgreSQL orders UUIDs |
 | `KeysetCursorTest` (unit) | Encoding and decoding of list cursors (conversations and messages), a stable format; rejection of cursors the server didn't issue |
 | `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing, pagination by number and by cursor (equal timestamps, every conversation exactly once across pages of several sizes, changes between pages, invalid cursors), access control (`401`, `403`, `404` for non-members), adding and removing members, the member limit, promoting and demoting (last administrator, invalid changes), renaming, deleting, leaving, the administrator hand-over and the deletion of groups whose last member leaves |
 | `ConversationServiceIT` | Concurrent creation of the same direct conversation; under the conversation lock: concurrent adds of the same user, concurrent adds near the member limit, concurrent leaves, administrators demoting themselves at once, deletion during an addition, the last two members leaving at once; rollback when a membership insert fails or a deletion can't be completed; agreement with PostgreSQL's UUID order |
-| `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed commit is a `500` without details that changes nothing), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), sending moves the conversation to the top of the list while rejected messages don't, the history's order (equal timestamps), pagination by number and by cursor (every message exactly once across pages of several sizes, new messages between pages, size limit, invalid cursors), no messages from other conversations |
-| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times in commit order, while other conversations aren't held up; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders or members it has |
+| `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed commit is a `500` without details that changes nothing), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), sending moves the conversation to the top of the list while rejected messages don't, the history's order (equal timestamps), pagination by number and by cursor (every message exactly once across pages of several sizes, new messages between pages, size limit, invalid cursors), no messages from other conversations; sequence numbers from 1 in each conversation |
+| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times and sequence numbers in commit order, while other conversations aren't held up; concurrent messages get consecutive sequence numbers; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders or members it has |
+| `ReceiptControllerIT` | Receipts and unread counts through HTTP: acknowledging delivery and reading (covers earlier messages, read implies delivered, delivered isn't read), repeated and outdated acknowledgements change nothing, positions never move back, access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), a message of another conversation is `404` like an unknown one, the member is always the caller, validation, every member's positions, independent positions in groups, leaving removes a position; unread counts exclude the member's own messages, count after the read position or everything without one, go down as the position moves, and are the same in the conversation list (by number and by cursor) as for each conversation |
+| `ReceiptServiceIT` | An outdated acknowledgement waiting for a newer one doesn't move the position back; concurrent mixed acknowledgements end at the furthest positions; a member removed while acknowledging gets `404` and no position; a position whose transaction fails is neither stored nor announced, and receipts write no outbox events; only changes are announced, to the members at that moment; statements for unread counts per list page, however many conversations it has |
 | `StompSecurityIT` | Over a real WebSocket connection: `CONNECT` with a valid token (the connection's user), with malformed, wrongly signed, expired, wrong-issuer and wrong-audience tokens, and without a bearer token; a token on the handshake is ignored; frames before `CONNECT` and unsupported frames; other origins can't connect; the rest of HTTP still needs a token; members can subscribe, non-members, former members and deleted groups get the same `404` as unknown IDs; patterns, other users' queues and other destinations are rejected; removed members stop receiving; non-members can't send; sending to broker destinations is rejected; the sender is always the connection's user; no `SUBSCRIBE` or `SEND` after the token expired |
 | `StompMessagingIT` | Over real WebSocket connections: a message is stored before it is delivered, to every subscriber including the sender, with the stored ID and time and the same JSON as the history; a message whose commit fails is reported to the sender only and never delivered; messages reach only their own conversation's topic; each message is delivered once, sent through REST or STOMP; invalid and unreadable messages are answered on the error queue and the connection stays open; one connection's messages are stored and delivered in the order sent; concurrent senders: every message stored once, delivered once, each sender's order kept; messages missed while disconnected are in the history |
+| `StompReceiptsIT` | Over real WebSocket connections: a receipt change is stored before it is delivered, to every member including the acknowledging one, as the REST answer; acknowledgements that change nothing deliver nothing; changes reach only their own conversation's receipts topic; removed members stop receiving them and can't subscribe again; only members can subscribe, other destinations are rejected; a change whose commit fails is never delivered |
 
-The STOMP tests run against a server on a random port (`webEnvironment = RANDOM_PORT`), so they start their own application context and containers.
+| `OutboxRelayTest` (unit) | What the relay makes of each broker answer (acknowledged, rejected, returned, unconfirmed, unreachable); any failed send ends the batch, and so does the end of the time for sending; batches, shutdown, the retry delay |
+| `MessageCountConsumerTest` (unit) | Reading and validating events: unreadable, incomplete, other types and versions are rejected without processing; unknown fields are ignored |
+| `MessagingConfigTest` (unit) | Which consumer failures are retried |
+| `OutboxIT` | Every stored message has exactly one pending `MessageCreated` event with the contract's fields and no content; a failure to write the event rolls back the message, and a message that can't be stored leaves no event; writing needs the sender's transaction |
+| `OutboxRelayIT` | Against a real broker: events are marked published only after RabbitMQ confirmed them; returned (unroutable), rejected (nack) and unconfirmed (paused broker) events stay pending with their error and are retried after their delay; batches; an event whose publication couldn't be recorded is published again and processed once; a claim's lease, and a relay whose lease expired can't record a failure any more; concurrent claims get different events without waiting; concurrent relays publish every event once |
+| `MessageCountConsumerIT` | Against a real broker: an event is processed and acknowledged; duplicate deliveries count once; transient failures are retried; an event that keeps failing is dead-lettered after its retries without any effect, with what's needed to investigate it, and doesn't block the queue; invalid events and events about unknown conversations are dead-lettered at once |
+| `BrokerOutageIT` | Over real WebSocket connections, with the scheduled relay: every message's event is published and processed once, and the consumer delivers nothing over WebSocket; while RabbitMQ is stopped, messages sent through REST and STOMP are stored and delivered, their events stay pending with errors, and are published and processed once after it restarts |
+
+The STOMP tests and `BrokerOutageIT` run against a server on a random port (`webEnvironment = RANDOM_PORT`). They, and `OutboxRelayIT`, start their own application context and containers. `OutboxRelayIT` and `BrokerOutageIT` pause or stop their RabbitMQ container, which no other test uses. The test profile turns the scheduled relay off; `OutboxRelayIT` runs the relay itself, and `BrokerOutageIT` turns the schedule on.
 
 To run only the conversation tests:
 
@@ -743,10 +1092,22 @@ To run only the message tests:
 ./mvnw verify -Dtest='KeysetCursorTest' -Dit.test='MessageControllerIT,MessageServiceIT,DatabaseSchemaIT'
 ```
 
+To run only the receipt and unread-count tests:
+
+```bash
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='ReceiptControllerIT,ReceiptServiceIT,StompReceiptsIT,DatabaseSchemaIT'
+```
+
 To run only the real-time (WebSocket/STOMP) tests:
 
 ```bash
-./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT'
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT,StompReceiptsIT'
+```
+
+To run only the asynchronous-event tests (outbox, relay, consumer):
+
+```bash
+./mvnw verify -Dtest='OutboxRelayTest,MessageCountConsumerTest,MessagingConfigTest' -Dit.test='OutboxIT,OutboxRelayIT,MessageCountConsumerIT,BrokerOutageIT'
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push to `main` and on every pull request.
@@ -771,6 +1132,9 @@ Existing migrations:
 | `V2__create_conversations.sql` | Creates `conversations`, `conversation_members` |
 | `V3__add_group_lifecycle.sql` | Adds `conversations.deleted_at` with its checks; marks groups without members deleted |
 | `V4__create_messages.sql` | Creates `messages` with its history index |
+| `V5__create_outbox_and_processed_events.sql` | Creates `outbox_events` with a partial index of pending events, `processed_events`, and the example consumer's `conversation_message_counts` |
+| `V6__add_message_sequence_numbers.sql` | Adds `messages.sequence_number`, numbers existing messages in history order, unique per conversation (its index includes the sender) |
+| `V7__create_receipt_positions.sql` | Creates `receipt_positions`: each member's delivered and read position, removed with the membership |
 
 To see which migrations have been applied to the local database:
 

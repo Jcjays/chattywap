@@ -43,6 +43,11 @@ import java.util.stream.Collectors;
  * that commits later can sort below one that was already visible. Messages stored in the same microsecond are
  * ordered by their random IDs.
  * <p>
+ * Every message also has a sequence number in its conversation: 1 for the first, one more for each following one,
+ * without gaps. It is assigned under the same lock, so it follows the commit order on any number of instances, whatever
+ * their clocks say. Read and delivery receipts are positions in this order ({@link ReceiptService}); the history keeps
+ * its order by time.
+ * <p>
  * Every stored message is announced with a {@link MessageSentEvent}, which the {@code realtime} feature delivers to
  * connected members once the transaction has committed. Both ways of sending, REST and STOMP, go through
  * {@link #sendMessage}, so each message is announced exactly once.
@@ -73,7 +78,7 @@ public class MessageService {
 	 * <p>
 	 * The conversation stays locked from the membership check to the commit, so a message is never stored after
 	 * its sender left or was removed, or after the group was deleted. Messages to the same conversation are stored
-	 * one after the other.
+	 * one after the other, each with the next sequence number.
 	 * <p>
 	 * Publishes a {@link MessageSentEvent} with the members at that moment as recipients. Listeners deliver it only
 	 * if the transaction commits, so a message that couldn't be stored is never delivered.
@@ -86,7 +91,11 @@ public class MessageService {
 		Instant createdAt = conversationService.recordActivity(callerId, conversationId);
 		// Read under the conversation lock that recordActivity took: nobody can join or leave until the commit.
 		Set<UUID> recipientIds = conversationService.getMemberIds(callerId, conversationId);
-		Message message = messageRepository.save(new Message(conversationId, callerId, content, createdAt));
+		// Also under the lock: no other message of the conversation can be stored before this one commits, so the next
+		// number is free, and a message that commits later gets a higher one.
+		long sequenceNumber = messageRepository.findLastSequenceNumber(conversationId) + 1;
+		Message message = messageRepository.save(
+				new Message(conversationId, sequenceNumber, callerId, content, createdAt));
 		MessageResponse response = toResponses(List.of(message)).getFirst();
 		eventPublisher.publishEvent(new MessageSentEvent(response, recipientIds));
 		return response;
@@ -153,7 +162,8 @@ public class MessageService {
 		Map<UUID, UserSummary> senders = userService.findUserSummaries(senderIds);
 		return messages.stream()
 				.map(message -> new MessageResponse(message.getId(), message.getConversationId(),
-						requireSender(senders, message.getSenderId()), message.getContent(), message.getCreatedAt()))
+						message.getSequenceNumber(), requireSender(senders, message.getSenderId()), message.getContent(),
+						message.getCreatedAt()))
 				.toList();
 	}
 
