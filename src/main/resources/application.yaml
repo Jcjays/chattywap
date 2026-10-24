@@ -14,6 +14,11 @@ spring:
       # Flyway owns the schema; Hibernate only checks that entities match it.
       ddl-auto: validate
     open-in-view: false
+  data:
+    web:
+      pageable:
+        # Paginated endpoints take ?page=0&size=20 (page is zero-based). Larger sizes are reduced to this.
+        max-page-size: 100
   rabbitmq:
     host: ${RABBITMQ_HOST:localhost}
     port: ${RABBITMQ_PORT:5672}
