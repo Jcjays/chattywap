@@ -6,7 +6,7 @@ package com.adonis.chattywap.conversation;
  */
 public enum MemberRole {
 
-	/** May add and remove members of the group. */
+	/** Manages the group: adds and removes members, promotes and demotes administrators, renames and deletes it. */
 	ADMIN,
 
 	MEMBER

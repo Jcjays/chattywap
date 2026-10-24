@@ -1,5 +1,6 @@
 package com.adonis.chattywap;
 
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -9,6 +10,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 
+import javax.sql.DataSource;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -30,12 +34,15 @@ class DatabaseSchemaIT {
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
+	@Autowired
+	private DataSource dataSource;
+
 	@Test
 	void migrationIsApplied() {
 		List<String> versions = jdbcTemplate.queryForList(
 				"select version from flyway_schema_history where success order by installed_rank", String.class);
 
-		assertThat(versions).contains("1", "2");
+		assertThat(versions).contains("1", "2", "3", "4");
 	}
 
 	@Test
@@ -252,6 +259,145 @@ class DatabaseSchemaIT {
 				.hasMessageContaining("conversations_created_by_fkey");
 	}
 
+	@Test
+	void onlyGroupsCanBeDeletedAndNotBeforeTheyWereCreated() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID otherUserId = insertUser(uniqueEmail());
+		UUID directId = insertDirect(userId, otherUserId);
+		UUID groupId = insertGroup(userId, "Group");
+
+		assertThatThrownBy(() -> jdbcTemplate.update("update conversations set deleted_at = now() where id = ?", directId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_only_groups_deleted");
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"update conversations set deleted_at = created_at - interval '1 second' where id = ?", groupId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_deleted_after_created");
+		assertThat(jdbcTemplate.update("update conversations set deleted_at = created_at where id = ?", groupId))
+				.isEqualTo(1);
+	}
+
+	@Test
+	void messageMustBelongToAnExistingConversationAndSender() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		assertThatThrownBy(() -> insertMessage(UUID.randomUUID(), userId, "Hello"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_conversation_id_fkey");
+		assertThatThrownBy(() -> insertMessage(groupId, UUID.randomUUID(), "Hello"))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_sender_id_fkey");
+	}
+
+	@Test
+	void messageContentMustNotBeBlank() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		for (String blank : List.of("", "   ", " \t\n\r\f\u000B ")) {
+			assertThatThrownBy(() -> insertMessage(groupId, userId, blank))
+					.isInstanceOf(DataIntegrityViolationException.class)
+					.hasMessageContaining("messages_content_not_blank");
+		}
+		// Surrounding whitespace is kept.
+		UUID messageId = insertMessage(groupId, userId, "\n Hello \n");
+		assertThat(jdbcTemplate.queryForObject("select content from messages where id = ?", String.class, messageId))
+				.isEqualTo("\n Hello \n");
+	}
+
+	@Test
+	void messageContentHasAtMost4000Characters() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(userId, "Group");
+
+		insertMessage(groupId, userId, "a".repeat(4000));
+		// Characters, not UTF-16 code units: the application's limit of 4000 code units always fits.
+		insertMessage(groupId, userId, "😀".repeat(4000));
+		assertThatThrownBy(() -> insertMessage(groupId, userId, "a".repeat(4001)))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("character varying(4000)");
+	}
+
+	@Test
+	void conversationsAndUsersWithMessagesCannotBeDeleted() {
+		UUID creatorId = insertUser(uniqueEmail());
+		// The database doesn't require senders to be members; that's the application's rule. A sender who
+		// belongs to no conversation shows that the message alone keeps the user.
+		UUID senderId = insertUser(uniqueEmail());
+		UUID groupId = insertGroup(creatorId, "Group");
+		insertMessage(groupId, senderId, "Hello");
+
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from conversations where id = ?", groupId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_conversation_id_fkey");
+		assertThatThrownBy(() -> jdbcTemplate.update("delete from users where id = ?", senderId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("messages_sender_id_fkey");
+	}
+
+	/**
+	 * Applies the migrations up to V2 to an empty schema, stores conversations the way the application did before
+	 * V3, then applies V3: groups that had lost all their members become deleted, nothing else changes.
+	 */
+	@Test
+	void upgradingToV3DeletesGroupsWithoutMembers() {
+		String schema = "upgrade_" + UUID.randomUUID().toString().replace("-", "");
+		try {
+			migrate(schema, "2");
+			UUID userId = insertUser(schema, uniqueEmail());
+			UUID otherUserId = insertUser(schema, uniqueEmail());
+			UUID emptyGroup = UUID.randomUUID();
+			UUID activeGroup = UUID.randomUUID();
+			UUID direct = UUID.randomUUID();
+			jdbcTemplate.update("""
+					insert into %s.conversations (id, type, name, created_by, created_at, updated_at)
+					values (?, 'GROUP', 'Empty', ?, timestamptz '2026-01-01 10:00Z', timestamptz '2026-01-02 10:00Z'),
+					       (?, 'GROUP', 'Active', ?, now(), now())
+					""".formatted(schema), emptyGroup, userId, activeGroup, userId);
+			jdbcTemplate.update("""
+					insert into %s.conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+					values (?, 'DIRECT', ?, least(?, ?), greatest(?, ?), now(), now())
+					""".formatted(schema), direct, userId, userId, otherUserId, userId, otherUserId);
+			jdbcTemplate.update("""
+					insert into %s.conversation_members (id, conversation_id, user_id, role, joined_at)
+					values (?, ?, ?, 'ADMIN', now()), (?, ?, ?, 'MEMBER', now()), (?, ?, ?, 'MEMBER', now())
+					""".formatted(schema), UUID.randomUUID(), activeGroup, userId, UUID.randomUUID(), direct, userId,
+					UUID.randomUUID(), direct, otherUserId);
+
+			migrate(schema, "3");
+
+			String deletedAt = "select deleted_at from " + schema + ".conversations where id = ?";
+			// When the last member left, which is when the group was last updated.
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, emptyGroup).toInstant())
+					.isEqualTo(Instant.parse("2026-01-02T10:00:00Z"));
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, activeGroup)).isNull();
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, direct)).isNull();
+		}
+		finally {
+			jdbcTemplate.execute("drop schema if exists " + schema + " cascade");
+		}
+	}
+
+	/** Applies the application's migrations up to {@code version} to {@code schema}, creating it if needed. */
+	private void migrate(String schema, String version) {
+		Flyway.configure()
+				.dataSource(dataSource)
+				.schemas(schema)
+				.target(version)
+				.load()
+				.migrate();
+	}
+
+	private UUID insertUser(String schema, String email) {
+		UUID id = UUID.randomUUID();
+		jdbcTemplate.update("""
+				insert into %s.users (id, email, password_hash, display_name, created_at, updated_at)
+				values (?, ?, '{bcrypt}hash', 'Alice', now(), now())
+				""".formatted(schema), id, email);
+		return id;
+	}
+
 	private UUID insertGroup(UUID createdBy, String name) {
 		UUID id = UUID.randomUUID();
 		jdbcTemplate.update("""
@@ -262,11 +408,13 @@ class DatabaseSchemaIT {
 	}
 
 	/** Stores the pair in the required order, using PostgreSQL's own comparison. */
-	private void insertDirect(UUID userId, UUID otherUserId) {
+	private UUID insertDirect(UUID userId, UUID otherUserId) {
+		UUID id = UUID.randomUUID();
 		jdbcTemplate.update("""
 				insert into conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
 				values (?, 'DIRECT', ?, least(?, ?), greatest(?, ?), now(), now())
-				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId);
+				""", id, userId, userId, otherUserId, userId, otherUserId);
+		return id;
 	}
 
 	private void insertMember(UUID conversationId, UUID userId, String role) {
@@ -274,6 +422,15 @@ class DatabaseSchemaIT {
 				insert into conversation_members (id, conversation_id, user_id, role, joined_at)
 				values (?, ?, ?, ?, now())
 				""", UUID.randomUUID(), conversationId, userId, role);
+	}
+
+	private UUID insertMessage(UUID conversationId, UUID senderId, String content) {
+		UUID id = UUID.randomUUID();
+		jdbcTemplate.update("""
+				insert into messages (id, conversation_id, sender_id, content, created_at)
+				values (?, ?, ?, ?, now())
+				""", id, conversationId, senderId, content);
+		return id;
 	}
 
 	private UUID insertUser(String email) {

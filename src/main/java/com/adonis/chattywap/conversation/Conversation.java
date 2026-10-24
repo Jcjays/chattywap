@@ -51,6 +51,11 @@ class Conversation {
 	@Column(name = "updated_at", nullable = false)
 	private Instant updatedAt;
 
+	// Groups only: set when the group is deleted, explicitly or because its last member left. Deleted groups have
+	// no members and are never shown again.
+	@Column(name = "deleted_at")
+	private Instant deletedAt;
+
 	protected Conversation() {
 	}
 
@@ -76,6 +81,10 @@ class Conversation {
 		return type == ConversationType.GROUP;
 	}
 
+	boolean isDeleted() {
+		return deletedAt != null;
+	}
+
 	/**
 	 * For a direct conversation: the participant who isn't {@code userId}.
 	 */
@@ -84,11 +93,27 @@ class Conversation {
 	}
 
 	/**
-	 * Records that the conversation changed, for example its members. Conversation lists are ordered by this
-	 * time, most recent first.
+	 * Records activity in the conversation: a change to it, for example to its members, or a new message.
+	 * Conversation lists are ordered by this time, most recent first.
 	 */
 	void touch(Instant now) {
 		this.updatedAt = now;
+	}
+
+	/**
+	 * Groups only. {@code name} is already stripped of surrounding whitespace.
+	 */
+	void rename(String name, Instant now) {
+		this.name = name;
+		touch(now);
+	}
+
+	/**
+	 * Groups only. The caller removes the memberships in the same transaction.
+	 */
+	void markDeleted(Instant now) {
+		this.deletedAt = now;
+		touch(now);
 	}
 
 	UUID getId() {
