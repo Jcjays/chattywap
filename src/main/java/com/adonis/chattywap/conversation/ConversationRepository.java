@@ -33,7 +33,8 @@ interface ConversationRepository extends JpaRepository<Conversation, UUID> {
 	 * {@code SELECT ... FOR NO KEY UPDATE}: it blocks other membership changes, but not the foreign-key checks
 	 * of inserted members, which only need {@code FOR KEY SHARE}.
 	 * Every change to a group (members, roles, name, deletion) takes this lock first, so changes to the same
-	 * conversation run one after the other and each one sees the members the previous one left.
+	 * conversation run one after the other and each one sees the members the previous one left. New messages take
+	 * it too, in any conversation ({@code ConversationService#recordActivity}).
 	 */
 	@Lock(LockModeType.PESSIMISTIC_WRITE)
 	@Query("select c from Conversation c where c.id = :id")

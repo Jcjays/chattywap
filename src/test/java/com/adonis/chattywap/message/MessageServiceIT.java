@@ -17,26 +17,30 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
 
 /**
- * Behavior that HTTP tests can't easily provoke: sending a message while its sender loses access, and the number
- * of queries a page of history takes. Calls {@link MessageService} directly.
+ * Behavior that HTTP tests can't easily provoke: sending messages while the sender loses access, while others send
+ * or change the group, and the number of queries sending and paging take. Calls {@link MessageService} directly.
  * <p>
- * The concurrency tests hold one transaction open at a chosen point and check that the other one waits for it
- * in PostgreSQL ({@code pg_stat_activity}), instead of relying on timing.
+ * Several tests hold one transaction open at a chosen point and check that the other one waits for it in
+ * PostgreSQL ({@code pg_stat_activity}), instead of relying on timing.
  */
 @SpringBootTest
 @Import(TestcontainersConfiguration.class)
@@ -104,8 +108,8 @@ class MessageServiceIT {
 		UUID bob = createUser();
 		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
 
-		// Without the lock, the send would see the membership that the uncommitted leave already deleted, and
-		// store the message after Bob had left.
+		// The send sees the membership that the uncommitted leave already deleted, so only the check under the lock
+		// keeps it from storing the message after Bob left.
 		assertSendingWaitsAndFails(bob, group, () -> conversationService.leave(bob, group));
 
 		assertThat(messageCount(group)).isZero();
@@ -132,46 +136,43 @@ class MessageServiceIT {
 		assertSendingWaitsAndFails(bob, group, () -> conversationService.deleteGroup(alice, group));
 
 		assertThat(messageCount(group)).isZero();
-		assertThat(jdbcTemplate.queryForObject("select deleted_at is not null from conversations where id = ?",
-				Boolean.class, group)).isTrue();
+		// The rejected message recorded no activity after the deletion.
+		assertThat(updatedAt(group)).isEqualTo(jdbcTemplate.queryForObject(
+				"select deleted_at from conversations where id = ?", OffsetDateTime.class, group).toInstant());
 	}
 
 	@Test
-	void sendingHoldsUpNeitherOtherSendersNorOtherChangesToTheGroup() throws Exception {
+	void messagesToOneConversationAreStoredOneAfterTheOther() throws Exception {
 		UUID alice = createUser();
 		UUID bob = createUser();
-		UUID carol = createUser();
-		UUID newcomer = createUser();
-		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob, carol)).id();
+		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+		UUID otherGroup = conversationService.createGroupConversation(alice, "Other", List.of(bob)).id();
 		CountDownLatch sent = new CountDownLatch(1);
 		CountDownLatch commit = new CountDownLatch(1);
 
 		try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
 			try {
-				Future<MessageResponse> sending = executor.submit(() -> transactionTemplate.execute(status -> {
-					MessageResponse message = messageService.sendMessage(bob, group, "Hello");
+				Future<MessageResponse> first = executor.submit(() -> transactionTemplate.execute(status -> {
+					MessageResponse message = messageService.sendMessage(alice, group, "First");
 					status.flush();
 					sent.countDown();
 					await(commit);
 					return message;
 				}));
 				await(sent);
+				Future<MessageResponse> second = executor.submit(() -> messageService.sendMessage(bob, group, "Second"));
 
-				// All of these finish while Bob's transaction is still open. Bob's own role changes too: only
-				// deleting his membership waits for him.
-				Future<?> others = executor.submit(() -> {
-					messageService.sendMessage(carol, group, "Hi");
-					conversationService.promoteToAdmin(alice, group, bob);
-					conversationService.renameGroup(alice, group, "Renamed");
-					conversationService.addMembers(alice, group, List.of(newcomer));
-					conversationService.leave(carol, group);
-				});
-				others.get(30, TimeUnit.SECONDS);
-				assertThat(sending).isNotDone();
-
+				awaitWaitingForLock(second);
+				// Other conversations aren't held up.
+				messageService.sendMessage(bob, otherGroup, "Elsewhere");
 				commit.countDown();
-				sending.get(30, TimeUnit.SECONDS);
-				assertThat(messageCount(group)).isEqualTo(2);
+
+				MessageResponse firstMessage = first.get(30, TimeUnit.SECONDS);
+				MessageResponse secondMessage = second.get(30, TimeUnit.SECONDS);
+				// The second message took its time only after the first one had committed: the history order is the
+				// order in which the messages became visible.
+				assertThat(secondMessage.createdAt()).isAfter(firstMessage.createdAt());
+				assertThat(updatedAt(group)).isEqualTo(secondMessage.createdAt());
 			}
 			finally {
 				commit.countDown();
@@ -180,92 +181,55 @@ class MessageServiceIT {
 	}
 
 	@Test
-	void aRemovalThatHoldsTheConversationLockDoesNotBlockTheSendItWaitsFor() throws Exception {
-		UUID alice = createUser();
-		UUID bob = createUser();
-		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
-		CountDownLatch locked = new CountDownLatch(1);
-		CountDownLatch store = new CountDownLatch(1);
+	void concurrentMessagesAndGroupChangesNeitherDeadlockNorLoseActivity() throws Exception {
+		for (int round = 0; round < 5; round++) {
+			UUID alice = createUser();
+			UUID bob = createUser();
+			UUID carol = createUser();
+			UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob, carol)).id();
+			int currentRound = round;
 
-		try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-			try {
-				// Bob's membership is locked, but his message isn't written yet.
-				Future<MessageResponse> sending = executor.submit(() -> transactionTemplate.execute(status -> {
-					conversationService.lockMembership(bob, group);
-					locked.countDown();
-					await(store);
-					return messageService.sendMessage(bob, group, "Last words");
-				}));
-				await(locked);
-				// The removal takes the conversation lock, then waits for Bob's membership.
-				Future<?> removing = executor.submit(() -> conversationService.removeMember(alice, group, bob));
-				awaitWaitingForLock(removing);
+			// A deadlock or any other failure than a rejected message fails runConcurrently.
+			List<Boolean> sent = runConcurrently(6, attempt -> switch (attempt) {
+				case 0, 1 -> trySend(bob, group, "Bob " + attempt);
+				case 2 -> trySend(carol, group, "Carol");
+				case 3 -> trySend(alice, group, "Alice");
+				case 4 -> {
+					conversationService.removeMember(alice, group, bob);
+					yield null;
+				}
+				default -> {
+					conversationService.renameGroup(alice, group, "Renamed " + currentRound);
+					yield null;
+				}
+			});
 
-				// Only now is the message written. Its foreign-key check locks the conversation row (FOR KEY SHARE),
-				// which the group-change lock (FOR NO KEY UPDATE) allows. With a stronger lock, the two transactions
-				// would wait for each other and PostgreSQL would abort one of them.
-				store.countDown();
-
-				UUID messageId = sending.get(30, TimeUnit.SECONDS).id();
-				removing.get(30, TimeUnit.SECONDS);
-				assertThat(count("select count(*) from messages where id = ?", messageId)).isEqualTo(1);
-				assertThat(isMember(group, bob)).isFalse();
-			}
-			finally {
-				store.countDown();
-			}
+			// Bob's messages were stored before his removal or not at all; Alice's and Carol's always.
+			assertThat(sent.subList(2, 4)).containsOnly(true);
+			assertThat(count("select count(*) from messages where conversation_id = ? and sender_id = ?", group, bob))
+					.isEqualTo((int) sent.subList(0, 2).stream().filter(Boolean::booleanValue).count());
+			assertThat(isMember(group, bob)).isFalse();
+			// The latest activity is the conversation's activity time: its newest message, or a later change.
+			Instant newestMessage = jdbcTemplate.queryForObject(
+					"select max(created_at) from messages where conversation_id = ?", OffsetDateTime.class, group)
+					.toInstant();
+			assertThat(updatedAt(group)).isAfterOrEqualTo(newestMessage);
 		}
 	}
 
 	@Test
-	void sendingDoesNotWaitForGroupChangesInProgress() throws Exception {
-		UUID alice = createUser();
-		UUID bob = createUser();
-		UUID newcomer = createUser();
-		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
-		CountDownLatch changed = new CountDownLatch(1);
-		CountDownLatch commit = new CountDownLatch(1);
-
-		try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-			try {
-				// Holds the conversation lock, with the changes written but not committed. Bob's own membership row
-				// is changed too, by the promotion.
-				Future<?> changing = executor.submit(() -> transactionTemplate.executeWithoutResult(status -> {
-					conversationService.renameGroup(alice, group, "Renamed");
-					conversationService.addMembers(alice, group, List.of(newcomer));
-					conversationService.promoteToAdmin(alice, group, bob);
-					status.flush();
-					changed.countDown();
-					await(commit);
-				}));
-				await(changed);
-
-				Future<MessageResponse> sending = executor.submit(() -> messageService.sendMessage(bob, group, "Hi"));
-				sending.get(30, TimeUnit.SECONDS);
-				assertThat(changing).isNotDone();
-
-				commit.countDown();
-				changing.get(30, TimeUnit.SECONDS);
-				assertThat(messageCount(group)).isEqualTo(1);
-			}
-			finally {
-				commit.countDown();
-			}
-		}
-	}
-
-	@Test
-	void theMembershipLockNeedsTheCallersTransaction() {
+	void recordingActivityNeedsTheCallersTransaction() {
 		UUID alice = createUser();
 		UUID group = conversationService.createGroupConversation(alice, "Group", List.of()).id();
 
-		// Outside a transaction, the lock would be released as soon as it was taken.
-		assertThatThrownBy(() -> conversationService.lockMembership(alice, group))
+		// Outside a transaction, the activity time would commit without the message, and the lock would be released
+		// before the message is stored.
+		assertThatThrownBy(() -> conversationService.recordActivity(alice, group))
 				.isInstanceOf(IllegalTransactionStateException.class);
 	}
 
 	@Test
-	void aPageTakesTheSameNumberOfQueriesHoweverManySendersItHas() {
+	void sendingAndPagingTakeTheSameNumberOfQueriesHoweverManySendersThereAre() {
 		UUID alice = createUser();
 		List<UUID> others = new ArrayList<>();
 		for (int i = 0; i < 9; i++) {
@@ -288,8 +252,9 @@ class MessageServiceIT {
 		// By number: the membership check, the page, the count and the senders. By cursor, no count.
 		assertThat(byNumberTen).isEqualTo(byNumberOne).isEqualTo(4);
 		assertThat(byCursorTen).isEqualTo(byCursorOne).isEqualTo(3);
-		// Sending: the membership lock, the insert and the sender.
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(3);
+		// Sending: the membership check, the conversation lock, the membership check under the lock, the sender, the
+		// message and the conversation's activity time.
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(6);
 	}
 
 	/**
@@ -323,6 +288,17 @@ class MessageServiceIT {
 			finally {
 				commit.countDown();
 			}
+		}
+	}
+
+	/** Whether the message was stored: {@code false} if the sender wasn't, or no longer was, a member. */
+	private boolean trySend(UUID senderId, UUID conversationId, String content) {
+		try {
+			messageService.sendMessage(senderId, conversationId, content);
+			return true;
+		}
+		catch (ConversationNotFoundException ex) {
+			return false;
 		}
 	}
 
@@ -371,6 +347,30 @@ class MessageServiceIT {
 		}
 	}
 
+	/**
+	 * Starts all attempts at the same moment and returns their results. Fails if any attempt fails.
+	 */
+	private static <T> List<T> runConcurrently(int attempts, IntFunction<T> action) throws Exception {
+		CountDownLatch start = new CountDownLatch(1);
+		List<Future<T>> futures = new ArrayList<>();
+		try (ExecutorService executor = Executors.newFixedThreadPool(attempts)) {
+			for (int i = 0; i < attempts; i++) {
+				int attempt = i;
+				Callable<T> task = () -> {
+					start.await();
+					return action.apply(attempt);
+				};
+				futures.add(executor.submit(task));
+			}
+			start.countDown();
+			List<T> results = new ArrayList<>();
+			for (Future<T> future : futures) {
+				results.add(future.get(30, TimeUnit.SECONDS));
+			}
+			return results;
+		}
+	}
+
 	private UUID createUser() {
 		return userService.createUser("user-" + UUID.randomUUID() + "@example.com", "{bcrypt}not-a-real-hash", "User")
 				.id();
@@ -383,6 +383,11 @@ class MessageServiceIT {
 
 	private int messageCount(UUID conversationId) {
 		return count("select count(*) from messages where conversation_id = ?", conversationId);
+	}
+
+	private Instant updatedAt(UUID conversationId) {
+		return jdbcTemplate.queryForObject("select updated_at from conversations where id = ?", OffsetDateTime.class,
+				conversationId).toInstant();
 	}
 
 	private int count(String sql, Object... args) {

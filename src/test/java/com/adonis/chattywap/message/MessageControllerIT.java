@@ -58,6 +58,8 @@ class MessageControllerIT {
 
 	private static final String INVALID_CHARACTERS = "must not contain NUL characters or unpaired surrogates";
 
+	private static final String CONVERSATIONS = "/api/v1/conversations";
+
 	@Autowired
 	private MockMvcTester mvc;
 
@@ -250,19 +252,42 @@ class MessageControllerIT {
 	}
 
 	@Test
-	void aMessageThatCannotBeStoredIsAServerErrorWithoutDetails() {
+	void aMessageThatCannotBeStoredIsAServerErrorAndChangesNothing() {
 		TestUser alice = createUser("Alice");
-		UUID group = createGroup(alice);
+		UUID older = createGroup(alice);
+		UUID newer = createGroup(alice);
+		setTimes(older, minutesAgo(2));
+		setTimes(newer, minutesAgo(1));
+		Instant activityBefore = updatedAt(older);
 
-		// The insert runs when the transaction commits, before the response is written.
-		MvcTestResult result = whileStoringMessagesFails(group, () -> send(alice, group, "Hello"));
+		// PostgreSQL rejects the message at commit, after the message and the conversation's activity time were
+		// both written: the whole transaction rolls back, before the response is written.
+		MvcTestResult result = whileStoringMessagesFails(older, () -> send(alice, older, "Hello"));
 
 		assertThat(result).hasStatus(HttpStatus.INTERNAL_SERVER_ERROR);
 		assertThat(result).hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
 		assertThat(result).bodyJson().extractingPath("$.detail").isEqualTo("An unexpected error occurred.");
 		assertThat(body(result)).doesNotContainIgnoringCase("simulated").doesNotContainIgnoringCase("sql")
 				.doesNotContainIgnoringCase("exception");
-		assertThat(messageCount(group)).isZero();
+		assertThat(messageCount(older)).isZero();
+		assertThat(updatedAt(older)).isEqualTo(activityBefore);
+		assertThat(ids(get(alice, CONVERSATIONS))).containsExactly(newer.toString(), older.toString());
+	}
+
+	@Test
+	void rejectedMessagesLeaveTheConversationsActivityUnchanged() {
+		TestUser alice = createUser("Alice");
+		TestUser bob = createUser("Bob");
+		TestUser mallory = createUser("Mallory");
+		UUID group = createGroup(alice, bob);
+		conversationService.leave(bob.id(), group);
+		setTimes(group, minutesAgo(1));
+		Instant activityBefore = updatedAt(group);
+
+		assertThat(send(alice, group, "   ")).hasStatus(HttpStatus.BAD_REQUEST);
+		assertNotFound(send(bob, group, "I left"), send(mallory, group, "Not a member"));
+
+		assertThat(updatedAt(group)).isEqualTo(activityBefore);
 	}
 
 	@Test
@@ -338,6 +363,45 @@ class MessageControllerIT {
 		assertUnauthorized(mvc.get().uri(messages(group)).header(HttpHeaders.AUTHORIZATION, "Bearer not-a-jwt")
 				.exchange());
 		assertThat(messageCount(group)).isZero();
+	}
+
+	// ---------------------------------------------------------------------------------------------------------
+	// Conversation activity
+
+	@Test
+	void sendingAMessageMovesTheConversationToTheTopOfTheList() {
+		TestUser alice = createUser("Alice");
+		TestUser bob = createUser("Bob");
+		UUID oldest = createGroup(alice, bob);
+		UUID middle = createGroup(alice, bob);
+		UUID direct = createDirect(alice, bob);
+		setTimes(oldest, minutesAgo(3));
+		setTimes(middle, minutesAgo(2));
+		setTimes(direct, minutesAgo(1));
+		assertThat(ids(get(alice, CONVERSATIONS))).containsExactly(direct.toString(), middle.toString(),
+				oldest.toString());
+
+		JsonNode message = json(send(bob, oldest, "Anyone still here?"));
+
+		// For every member, by page number and by cursor alike.
+		for (TestUser member : List.of(alice, bob)) {
+			MvcTestResult byNumber = get(member, CONVERSATIONS);
+			assertThat(ids(byNumber)).containsExactly(oldest.toString(), direct.toString(), middle.toString());
+			assertThat(byNumber).bodyJson().extractingPath("$.content[0].updatedAt")
+					.isEqualTo(message.get("createdAt").asString());
+			String afterFirst = nextCursor(get(member, CONVERSATIONS + "?size=1"));
+			assertThat(ids(get(member, CONVERSATIONS + "?size=2&cursor=" + afterFirst)))
+					.containsExactly(direct.toString(), middle.toString());
+		}
+		// The conversation's activity time is the message's time; the details show it too.
+		assertThat(updatedAt(oldest)).isEqualTo(Instant.parse(message.get("createdAt").asString()));
+		assertThat(get(alice, CONVERSATIONS + "/" + oldest)).bodyJson().extractingPath("$.updatedAt")
+				.isEqualTo(message.get("createdAt").asString());
+
+		send(alice, middle, "Me too");
+
+		assertThat(ids(get(bob, CONVERSATIONS))).containsExactly(middle.toString(), oldest.toString(),
+				direct.toString());
 	}
 
 	// ---------------------------------------------------------------------------------------------------------
@@ -493,6 +557,42 @@ class MessageControllerIT {
 		assertThat(ids(get(alice, messages(group) + "?size=2&cursor=" + cursorAfterThree)))
 				.isEqualTo(ids(get(alice, messages(group) + "?size=2&cursor=" + cursorAfterThree)))
 				.containsExactly(expected.get(3), expected.get(4));
+	}
+
+	@Test
+	void pagingThroughAnUnchangingHistoryReturnsEveryMessageExactlyOnce() {
+		TestUser alice = createUser("Alice");
+		TestUser bob = createUser("Bob");
+		UUID group = createGroup(alice, bob);
+		UUID otherGroup = createGroup(alice, bob);
+		// 137 messages in runs of five with the same time, so that page boundaries fall inside runs of equal times.
+		// The other conversation has messages at exactly the same times, which must never show up.
+		for (UUID conversationId : List.of(group, otherGroup)) {
+			jdbcTemplate.update("""
+					insert into messages (id, conversation_id, sender_id, content, created_at)
+					select gen_random_uuid(), ?, case when n % 2 = 0 then ? else ? end, 'Message ' || n,
+					       timestamptz '2026-10-24 10:00:00Z' - (n / 5) * interval '1 second'
+					from generate_series(1, 137) n
+					""", conversationId, alice.id(), bob.id());
+		}
+		// The expected order, worked out here rather than by the database: newest first, then by ID descending
+		// (PostgreSQL orders UUIDs like their lower-case text, which is how UUID.toString() writes them).
+		List<String> expected = jdbcTemplate.query("select id, created_at from messages where conversation_id = ?",
+						(row, rowNumber) -> Map.entry(row.getObject("created_at", OffsetDateTime.class).toInstant(),
+								row.getObject("id", UUID.class).toString()),
+						group)
+				.stream()
+				.sorted(Map.Entry.<Instant, String>comparingByKey()
+						.thenComparing(Map.Entry.<Instant, String>comparingByValue())
+						.reversed())
+				.map(Map.Entry::getValue)
+				.toList();
+		assertThat(expected).hasSize(137).doesNotHaveDuplicates();
+
+		for (int size : List.of(1, 5, 7, 20, 100)) {
+			assertThat(allByCursor(bob, group, size)).as("by cursor, size %d", size).containsExactlyElementsOf(expected);
+			assertThat(allByNumber(bob, group, size)).as("by number, size %d", size).containsExactlyElementsOf(expected);
+		}
 	}
 
 	@Test
@@ -738,6 +838,32 @@ class MessageControllerIT {
 		return ids;
 	}
 
+	/** The IDs of the whole history, read by following {@code nextCursor} from the first page. */
+	private List<String> allByCursor(TestUser caller, UUID conversationId, int size) {
+		List<String> all = new ArrayList<>();
+		String cursor = "";
+		do {
+			MvcTestResult page = get(caller, messages(conversationId) + "?size=" + size + "&cursor=" + cursor);
+			all.addAll(ids(page));
+			cursor = nextCursor(page);
+			assertThat(all.size()).as("pages never end").isLessThan(10_000);
+		} while (cursor != null);
+		return all;
+	}
+
+	/** The IDs of the whole history, read page by page number until a page is empty. */
+	private List<String> allByNumber(TestUser caller, UUID conversationId, int size) {
+		List<String> all = new ArrayList<>();
+		for (int page = 0; ; page++) {
+			List<String> ids = ids(get(caller, messages(conversationId) + "?size=" + size + "&page=" + page));
+			if (ids.isEmpty()) {
+				return all;
+			}
+			all.addAll(ids);
+			assertThat(all.size()).as("pages never end").isLessThan(10_000);
+		}
+	}
+
 	/** The page's {@code nextCursor}, or {@code null} if it has none. */
 	private String nextCursor(MvcTestResult result) {
 		assertThat(result).hasStatusOk();
@@ -782,7 +908,8 @@ class MessageControllerIT {
 	}
 
 	/**
-	 * Makes PostgreSQL reject every message stored in the conversation while {@code action} runs.
+	 * Makes PostgreSQL reject every message stored in the conversation while {@code action} runs. The trigger is
+	 * deferred: it fails the transaction when it commits, after all its statements ran.
 	 */
 	private <T> T whileStoringMessagesFails(UUID conversationId, Supplier<T> action) {
 		jdbcTemplate.execute("""
@@ -792,8 +919,9 @@ class MessageControllerIT {
 				end
 				$$
 				""");
-		jdbcTemplate.execute("create trigger simulated_failure before insert on messages for each row when "
-				+ "(new.conversation_id = '" + conversationId + "') execute function simulated_failure()");
+		jdbcTemplate.execute("create constraint trigger simulated_failure after insert on messages "
+				+ "deferrable initially deferred for each row when (new.conversation_id = '" + conversationId + "') "
+				+ "execute function simulated_failure()");
 		try {
 			return action.get();
 		}
@@ -805,6 +933,18 @@ class MessageControllerIT {
 
 	private int count(String sql, Object... args) {
 		return jdbcTemplate.queryForObject(sql, Integer.class, args);
+	}
+
+	/** Sets when the conversation was created and last active, to control the conversation list's order. */
+	private void setTimes(UUID conversationId, OffsetDateTime time) {
+		jdbcTemplate.update("update conversations set created_at = ?, updated_at = ? where id = ?", time, time,
+				conversationId);
+	}
+
+	/** The conversation's activity time, which orders the conversation list. */
+	private Instant updatedAt(UUID conversationId) {
+		return jdbcTemplate.queryForObject("select updated_at from conversations where id = ?", OffsetDateTime.class,
+				conversationId).toInstant();
 	}
 
 	private int messageCount(UUID conversationId) {

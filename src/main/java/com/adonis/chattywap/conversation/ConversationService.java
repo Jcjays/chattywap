@@ -59,7 +59,8 @@ import java.util.stream.Collectors;
  * Every change to a group locks the conversation row first, so concurrent changes to one conversation run one
  * after the other. Without the lock, two concurrent requests could, for example, add the same user twice, add
  * members past the limit, or leave the group without an administrator (the last administrator leaving while the
- * member chosen as the new one leaves too; two administrators demoting themselves at once).
+ * member chosen as the new one leaves too; two administrators demoting themselves at once). Activity recorded for
+ * other features ({@link #recordActivity}, for new messages) takes the same lock, of any conversation.
  */
 @Service
 public class ConversationService {
@@ -287,24 +288,29 @@ public class ConversationService {
 	}
 
 	/**
-	 * Like {@link #requireMembership}, and keeps the caller a member until the calling transaction ends. For
-	 * changes made on the caller's behalf, such as posting a message, that must not be stored once the caller has
-	 * lost access to the conversation.
+	 * Records activity of the caller in the conversation, such as posting a message, and returns its time. The
+	 * conversation's {@code updatedAt} moves to that time, which moves the conversation to the top of its members'
+	 * lists. For other features, which store the activity itself (the message) in the same transaction, with the
+	 * returned time: if that fails, the transaction rolls back and {@code updatedAt} keeps its value.
 	 * <p>
-	 * Locks the caller's membership row. Leaving, being removed and the deletion of the group all delete that row,
-	 * so they wait until the calling transaction ends; if one of them came first, this call waits for it and then
-	 * finds no membership. Nothing else waits for it directly: not role changes, renames or additions, and not other
-	 * members doing the same. It doesn't lock the conversation row either, so it never waits for the lock that group
-	 * changes take. But a leave, removal or deletion that waits holds that lock meanwhile, so other changes to the
-	 * group queue behind it: keep the calling transaction short.
+	 * Takes the conversation lock like every change to a group, after checking that the caller is a member, and
+	 * checks the membership again under the lock. Until the calling transaction ends, the caller therefore stays a
+	 * member: leaving, removal and deletion of the group wait, and if one of them came first, this call waits for it
+	 * and then fails. Activities in one conversation also run one after the other. The time is read after the lock
+	 * is taken, so as long as the clock doesn't go back, an activity that commits later gets a later time.
 	 *
+	 * @return the time of the activity, in microseconds
 	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
 	 */
 	@Transactional(propagation = Propagation.MANDATORY)
-	public void lockMembership(UUID callerId, UUID conversationId) {
-		if (memberRepository.lockMembershipInActiveConversation(conversationId, callerId).isEmpty()) {
+	public Instant recordActivity(UUID callerId, UUID conversationId) {
+		Conversation conversation = lockConversationAsMember(conversationId, callerId);
+		if (!memberRepository.existsByConversationIdAndUserId(conversationId, callerId)) {
 			throw new ConversationNotFoundException();
 		}
+		Instant now = now();
+		conversation.touch(now);
+		return now;
 	}
 
 	/**

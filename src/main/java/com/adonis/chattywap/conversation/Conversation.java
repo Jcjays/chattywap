@@ -93,8 +93,8 @@ class Conversation {
 	}
 
 	/**
-	 * Records that the conversation changed, for example its members. Conversation lists are ordered by this
-	 * time, most recent first.
+	 * Records activity in the conversation: a change to it, for example to its members, or a new message.
+	 * Conversation lists are ordered by this time, most recent first.
 	 */
 	void touch(Instant now) {
 		this.updatedAt = now;

@@ -17,7 +17,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -33,11 +32,14 @@ import java.util.stream.Collectors;
  * are removed lose access to the whole history, including their own messages; the messages stay, with their
  * sender, for the remaining members.
  * <p>
- * A conversation's history is ordered by {@code createdAt}, newest first, then by ID. The server sets
- * {@code createdAt} when it stores the message, shortly before the transaction commits. Messages stored in the same
- * microsecond are ordered by their random IDs: the order is stable, but not necessarily the order in which they
- * were sent. And a message whose commit takes longer than a later message's becomes visible after that one, already
- * sorted below it.
+ * A conversation's history is ordered by {@code createdAt}, newest first, then by ID, which makes the order total
+ * and the same on every request. {@code createdAt} is a timestamp, not a sequence number: the time
+ * {@link ConversationService#recordActivity} returns. Messages of one conversation are stored one after the other,
+ * under the conversation lock, and that time is read after the lock is taken, so with one application clock that
+ * doesn't go back, a message that commits later has a later time: the history order is the commit order. With
+ * several application instances whose clocks differ, or a clock that is set back, it isn't guaranteed: a message
+ * that commits later can sort below one that was already visible. Messages stored in the same microsecond are
+ * ordered by their random IDs.
  */
 @Service
 public class MessageService {
@@ -56,17 +58,21 @@ public class MessageService {
 	}
 
 	/**
-	 * Stores a message from the caller. The membership check and the insert happen in one transaction, with the
-	 * caller's membership locked in between: a message is never stored after its sender left or was removed, or
-	 * after the group was deleted. The message is committed when this method returns.
+	 * Stores a message from the caller and records it as the conversation's latest activity, which moves the
+	 * conversation to the top of its members' lists. Both happen in one transaction, committed when this method
+	 * returns: if the message can't be stored, the conversation's activity time doesn't change either.
+	 * <p>
+	 * The conversation stays locked from the membership check to the commit, so a message is never stored after
+	 * its sender left or was removed, or after the group was deleted. Messages to the same conversation are stored
+	 * one after the other.
 	 *
 	 * @param content valid as message content (see {@code SendMessageRequest}); stored as it is
 	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
 	 */
 	@Transactional
 	public MessageResponse sendMessage(UUID callerId, UUID conversationId, String content) {
-		conversationService.lockMembership(callerId, conversationId);
-		Message message = messageRepository.save(new Message(conversationId, callerId, content, now()));
+		Instant createdAt = conversationService.recordActivity(callerId, conversationId);
+		Message message = messageRepository.save(new Message(conversationId, callerId, content, createdAt));
 		return toResponses(List.of(message)).getFirst();
 	}
 
@@ -103,9 +109,9 @@ public class MessageService {
 	 * <p>
 	 * A cursor is a position in the history, not an offset, so messages sent while the client pages back through
 	 * the history don't shift the following pages: no message appears twice, and none is skipped because others
-	 * arrived. New messages sort before the cursor; the client gets them by loading the first page again. That
-	 * includes a message that committed late with a time newer than the cursor's (see the class comment): it sorts
-	 * into a page the client already has, so only reloading that part of the history shows it.
+	 * arrived. New messages sort before the cursor; the client gets them by loading the first page again. Where the
+	 * history order isn't the commit order (see the class comment), a message can commit with a time newer than the
+	 * cursor's after the client passed that point; only reloading that part of the history shows it.
 	 *
 	 * @param cursor a {@code nextCursor} from an earlier response
 	 * @throws InvalidCursorException if the cursor isn't one the server issued
@@ -149,14 +155,6 @@ public class MessageService {
 	/** The history position right after {@code message}: its sort key, {@code (createdAt, id)}. */
 	private static String cursorAfter(Message message) {
 		return new KeysetCursor(message.getCreatedAt(), message.getId()).encode();
-	}
-
-	/**
-	 * PostgreSQL stores microseconds. Truncating keeps the time in the response identical to the one read back
-	 * from the database later, and in cursors.
-	 */
-	private static Instant now() {
-		return Instant.now().truncatedTo(ChronoUnit.MICROS);
 	}
 
 }

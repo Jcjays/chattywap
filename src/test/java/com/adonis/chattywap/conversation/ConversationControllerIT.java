@@ -41,6 +41,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -1447,6 +1448,57 @@ class ConversationControllerIT {
 			assertThat(result).hasStatus(HttpStatus.BAD_REQUEST);
 			assertThat(result).hasContentType(MediaType.APPLICATION_PROBLEM_JSON);
 			assertThat(result).bodyJson().extractingPath("$.detail").isEqualTo("Invalid cursor.");
+		}
+	}
+
+	@Test
+	void pagingThroughAnUnchangingListReturnsEveryConversationExactlyOnce() {
+		TestUser alice = createUser("Alice");
+		// 53 groups in runs of four with the same activity time, so that page boundaries fall inside runs of equal
+		// times. Inserted directly because creating them one request at a time is slow.
+		jdbcTemplate.update("""
+				insert into conversations (id, type, name, created_by, created_at, updated_at)
+				select gen_random_uuid(), 'GROUP', 'Group ' || n, ?, t, t
+				from generate_series(1, 53) n,
+				     lateral (select timestamptz '2026-10-24 10:00:00Z' - (n / 4) * interval '1 second' as t) times
+				""", alice.id());
+		jdbcTemplate.update("""
+				insert into conversation_members (id, conversation_id, user_id, role, joined_at)
+				select gen_random_uuid(), id, created_by, 'ADMIN', created_at from conversations where created_by = ?
+				""", alice.id());
+		// The expected order, worked out here rather than by the database: most recent activity first, then by ID
+		// descending (PostgreSQL orders UUIDs like their lower-case text, which is how UUID.toString() writes them).
+		List<String> expected = jdbcTemplate.query("select id, updated_at from conversations where created_by = ?",
+						(row, rowNumber) -> Map.entry(row.getObject("updated_at", OffsetDateTime.class).toInstant(),
+								row.getObject("id", UUID.class).toString()),
+						alice.id())
+				.stream()
+				.sorted(Map.Entry.<Instant, String>comparingByKey()
+						.thenComparing(Map.Entry.<Instant, String>comparingByValue())
+						.reversed())
+				.map(Map.Entry::getValue)
+				.toList();
+		assertThat(expected).hasSize(53).doesNotHaveDuplicates();
+
+		for (int size : List.of(1, 4, 6, 20, 100)) {
+			List<String> byCursor = new ArrayList<>();
+			String cursor = "";
+			do {
+				MvcTestResult page = get(alice, CONVERSATIONS + "?size=" + size + "&cursor=" + cursor);
+				byCursor.addAll(ids(page));
+				cursor = nextCursor(page);
+			} while (cursor != null && byCursor.size() < 10_000);
+			List<String> byNumber = new ArrayList<>();
+			for (int page = 0; byNumber.size() < 10_000; page++) {
+				List<String> ids = ids(get(alice, CONVERSATIONS + "?size=" + size + "&page=" + page));
+				if (ids.isEmpty()) {
+					break;
+				}
+				byNumber.addAll(ids);
+			}
+
+			assertThat(byCursor).as("by cursor, size %d", size).containsExactlyElementsOf(expected);
+			assertThat(byNumber).as("by number, size %d", size).containsExactlyElementsOf(expected);
 		}
 	}
 
