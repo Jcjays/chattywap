@@ -166,32 +166,181 @@ class ConversationServiceIT {
 		assertThat(updatedAt(group)).isEqualTo(updatedAt);
 	}
 
+	@Test
+	void concurrentAdditionsCannotTogetherExceedTheMemberLimit() throws Exception {
+		UUID admin = createUser();
+		// Four places left; four requests of two new users each, so only two requests fit.
+		UUID group = conversationService.createGroupConversation(admin, "Group",
+				createUsers(ConversationService.MAX_GROUP_MEMBERS - 5)).id();
+		List<List<UUID>> batches = List.of(createUsers(2), createUsers(2), createUsers(2), createUsers(2));
+
+		List<Boolean> added = runConcurrently(batches.size(), attempt -> {
+			try {
+				conversationService.addMembers(admin, group, batches.get(attempt));
+				return true;
+			}
+			catch (GroupMemberLimitExceededException ex) {
+				return false;
+			}
+		});
+
+		assertThat(added).filteredOn(Boolean::booleanValue).hasSize(2);
+		assertThat(memberCount(group)).isEqualTo(ConversationService.MAX_GROUP_MEMBERS);
+		// Each request added both of its users or neither.
+		for (int i = 0; i < batches.size(); i++) {
+			int expected = added.get(i) ? 2 : 0;
+			assertThat(count("select count(*) from conversation_members where conversation_id = ? and user_id in (?, ?)",
+					group, batches.get(i).get(0), batches.get(i).get(1))).isEqualTo(expected);
+		}
+	}
+
+	@Test
+	void concurrentlyDemotingThemselvesTwoAdministratorsLeaveOne() throws Exception {
+		// Without the lock, both could see two administrators and both step down.
+		for (int round = 0; round < 5; round++) {
+			UUID alice = createUser();
+			UUID bob = createUser();
+			UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+			conversationService.promoteToAdmin(alice, group, bob);
+			List<UUID> admins = List.of(alice, bob);
+
+			List<Boolean> demoted = runConcurrently(2, attempt -> {
+				UUID self = admins.get(attempt);
+				try {
+					conversationService.demoteToMember(self, group, self);
+					return true;
+				}
+				catch (LastGroupAdminException ex) {
+					return false;
+				}
+			});
+
+			assertThat(demoted).containsExactlyInAnyOrder(true, false);
+			assertThat(adminCount(group)).isEqualTo(1);
+		}
+	}
+
+	@Test
+	void membersAddedWhileTheGroupIsDeletedDoNotSurviveIt() throws Exception {
+		for (int round = 0; round < 5; round++) {
+			UUID alice = createUser();
+			UUID bob = createUser();
+			UUID newcomer = createUser();
+			UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+			conversationService.promoteToAdmin(alice, group, bob);
+
+			// Either the addition runs first and the deletion removes the newcomer again, or the deletion runs
+			// first and the addition finds no group.
+			runConcurrently(2, attempt -> {
+				if (attempt == 0) {
+					conversationService.deleteGroup(alice, group);
+				}
+				else {
+					try {
+						conversationService.addMembers(bob, group, List.of(newcomer));
+					}
+					catch (ConversationNotFoundException ex) {
+						// The group was deleted first.
+					}
+				}
+				return null;
+			});
+
+			assertThat(memberCount(group)).isZero();
+			assertThat(isDeleted(group)).isTrue();
+		}
+	}
+
+	@Test
+	void theLastTwoMembersLeavingAtOnceDeleteTheGroup() throws Exception {
+		for (int round = 0; round < 5; round++) {
+			UUID alice = createUser();
+			UUID bob = createUser();
+			UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+			List<UUID> members = List.of(alice, bob);
+
+			runConcurrently(2, attempt -> {
+				conversationService.leave(members.get(attempt), group);
+				return null;
+			});
+
+			assertThat(memberCount(group)).isZero();
+			assertThat(isDeleted(group)).isTrue();
+		}
+	}
+
+	@Test
+	void deletingAGroupIsRolledBackWhenItCannotBeMarkedDeleted() {
+		UUID alice = createUser();
+		UUID bob = createUser();
+		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+
+		// The memberships are deleted first; marking the conversation deleted then fails.
+		rejectWhile("update", "conversations", "new.id = '" + group + "' and new.deleted_at is not null", () ->
+				assertThatThrownBy(() -> conversationService.deleteGroup(alice, group))
+						.hasStackTraceContaining("simulated failure"));
+
+		assertThat(memberCount(group)).isEqualTo(2);
+		assertThat(isDeleted(group)).isFalse();
+		assertThat(conversationService.getConversation(bob, group).members()).hasSize(2);
+	}
+
 	/**
 	 * Makes PostgreSQL reject every membership row for {@code userId} while {@code action} runs, so a transaction
 	 * fails after it has already written other rows.
 	 */
 	private void failInsertingMembershipsOf(UUID userId, Runnable action) {
+		rejectWhile("insert", "conversation_members", "new.user_id = '" + userId + "'", action);
+	}
+
+	/**
+	 * Makes PostgreSQL fail every {@code event} ({@code insert}, {@code update}) of a {@code table} row that
+	 * matches {@code condition} while {@code action} runs.
+	 */
+	private void rejectWhile(String event, String table, String condition, Runnable action) {
 		jdbcTemplate.execute("""
-				create function fail_membership_insert() returns trigger language plpgsql as $$
+				create function simulated_failure() returns trigger language plpgsql as $$
 				begin
 					raise exception 'simulated failure';
 				end
 				$$
 				""");
-		jdbcTemplate.execute("create trigger fail_membership_insert before insert on conversation_members "
-				+ "for each row when (new.user_id = '" + userId + "') execute function fail_membership_insert()");
+		jdbcTemplate.execute("create trigger simulated_failure before " + event + " on " + table
+				+ " for each row when (" + condition + ") execute function simulated_failure()");
 		try {
 			action.run();
 		}
 		finally {
-			jdbcTemplate.execute("drop trigger fail_membership_insert on conversation_members");
-			jdbcTemplate.execute("drop function fail_membership_insert()");
+			jdbcTemplate.execute("drop trigger simulated_failure on " + table);
+			jdbcTemplate.execute("drop function simulated_failure()");
 		}
 	}
 
 	private UUID createUser() {
 		return userService.createUser("user-" + UUID.randomUUID() + "@example.com", "{bcrypt}not-a-real-hash", "User")
 				.id();
+	}
+
+	private List<UUID> createUsers(int count) {
+		List<UUID> users = new ArrayList<>();
+		for (int i = 0; i < count; i++) {
+			users.add(createUser());
+		}
+		return users;
+	}
+
+	private int memberCount(UUID conversationId) {
+		return count("select count(*) from conversation_members where conversation_id = ?", conversationId);
+	}
+
+	private int adminCount(UUID conversationId) {
+		return count("select count(*) from conversation_members where conversation_id = ? and role = 'ADMIN'",
+				conversationId);
+	}
+
+	private boolean isDeleted(UUID conversationId) {
+		return jdbcTemplate.queryForObject("select deleted_at is not null from conversations where id = ?",
+				Boolean.class, conversationId);
 	}
 
 	private UUID insertUser(UUID id) {

@@ -1,5 +1,6 @@
 package com.adonis.chattywap;
 
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -9,6 +10,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 
+import javax.sql.DataSource;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -30,12 +34,15 @@ class DatabaseSchemaIT {
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
+	@Autowired
+	private DataSource dataSource;
+
 	@Test
 	void migrationIsApplied() {
 		List<String> versions = jdbcTemplate.queryForList(
 				"select version from flyway_schema_history where success order by installed_rank", String.class);
 
-		assertThat(versions).contains("1", "2");
+		assertThat(versions).contains("1", "2", "3");
 	}
 
 	@Test
@@ -252,6 +259,86 @@ class DatabaseSchemaIT {
 				.hasMessageContaining("conversations_created_by_fkey");
 	}
 
+	@Test
+	void onlyGroupsCanBeDeletedAndNotBeforeTheyWereCreated() {
+		UUID userId = insertUser(uniqueEmail());
+		UUID otherUserId = insertUser(uniqueEmail());
+		UUID directId = insertDirect(userId, otherUserId);
+		UUID groupId = insertGroup(userId, "Group");
+
+		assertThatThrownBy(() -> jdbcTemplate.update("update conversations set deleted_at = now() where id = ?", directId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_only_groups_deleted");
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"update conversations set deleted_at = created_at - interval '1 second' where id = ?", groupId))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.hasMessageContaining("conversations_deleted_after_created");
+		assertThat(jdbcTemplate.update("update conversations set deleted_at = created_at where id = ?", groupId))
+				.isEqualTo(1);
+	}
+
+	/**
+	 * Applies the migrations up to V2 to an empty schema, stores conversations the way the application did before
+	 * V3, then applies V3: groups that had lost all their members become deleted, nothing else changes.
+	 */
+	@Test
+	void upgradingToV3DeletesGroupsWithoutMembers() {
+		String schema = "upgrade_" + UUID.randomUUID().toString().replace("-", "");
+		try {
+			migrate(schema, "2");
+			UUID userId = insertUser(schema, uniqueEmail());
+			UUID otherUserId = insertUser(schema, uniqueEmail());
+			UUID emptyGroup = UUID.randomUUID();
+			UUID activeGroup = UUID.randomUUID();
+			UUID direct = UUID.randomUUID();
+			jdbcTemplate.update("""
+					insert into %s.conversations (id, type, name, created_by, created_at, updated_at)
+					values (?, 'GROUP', 'Empty', ?, timestamptz '2026-01-01 10:00Z', timestamptz '2026-01-02 10:00Z'),
+					       (?, 'GROUP', 'Active', ?, now(), now())
+					""".formatted(schema), emptyGroup, userId, activeGroup, userId);
+			jdbcTemplate.update("""
+					insert into %s.conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
+					values (?, 'DIRECT', ?, least(?, ?), greatest(?, ?), now(), now())
+					""".formatted(schema), direct, userId, userId, otherUserId, userId, otherUserId);
+			jdbcTemplate.update("""
+					insert into %s.conversation_members (id, conversation_id, user_id, role, joined_at)
+					values (?, ?, ?, 'ADMIN', now()), (?, ?, ?, 'MEMBER', now()), (?, ?, ?, 'MEMBER', now())
+					""".formatted(schema), UUID.randomUUID(), activeGroup, userId, UUID.randomUUID(), direct, userId,
+					UUID.randomUUID(), direct, otherUserId);
+
+			migrate(schema, "3");
+
+			String deletedAt = "select deleted_at from " + schema + ".conversations where id = ?";
+			// When the last member left, which is when the group was last updated.
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, emptyGroup).toInstant())
+					.isEqualTo(Instant.parse("2026-01-02T10:00:00Z"));
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, activeGroup)).isNull();
+			assertThat(jdbcTemplate.queryForObject(deletedAt, OffsetDateTime.class, direct)).isNull();
+		}
+		finally {
+			jdbcTemplate.execute("drop schema if exists " + schema + " cascade");
+		}
+	}
+
+	/** Applies the application's migrations up to {@code version} to {@code schema}, creating it if needed. */
+	private void migrate(String schema, String version) {
+		Flyway.configure()
+				.dataSource(dataSource)
+				.schemas(schema)
+				.target(version)
+				.load()
+				.migrate();
+	}
+
+	private UUID insertUser(String schema, String email) {
+		UUID id = UUID.randomUUID();
+		jdbcTemplate.update("""
+				insert into %s.users (id, email, password_hash, display_name, created_at, updated_at)
+				values (?, ?, '{bcrypt}hash', 'Alice', now(), now())
+				""".formatted(schema), id, email);
+		return id;
+	}
+
 	private UUID insertGroup(UUID createdBy, String name) {
 		UUID id = UUID.randomUUID();
 		jdbcTemplate.update("""
@@ -262,11 +349,13 @@ class DatabaseSchemaIT {
 	}
 
 	/** Stores the pair in the required order, using PostgreSQL's own comparison. */
-	private void insertDirect(UUID userId, UUID otherUserId) {
+	private UUID insertDirect(UUID userId, UUID otherUserId) {
+		UUID id = UUID.randomUUID();
 		jdbcTemplate.update("""
 				insert into conversations (id, type, created_by, direct_user1_id, direct_user2_id, created_at, updated_at)
 				values (?, 'DIRECT', ?, least(?, ?), greatest(?, ?), now(), now())
-				""", UUID.randomUUID(), userId, userId, otherUserId, userId, otherUserId);
+				""", id, userId, userId, otherUserId, userId, otherUserId);
+		return id;
 	}
 
 	private void insertMember(UUID conversationId, UUID userId, String role) {

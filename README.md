@@ -186,16 +186,20 @@ Every conversation endpoint requires an access token (`Authorization: Bearer <ac
 |---|---|---|
 | `POST /api/v1/conversations/direct` | `recipientId` | `201` with the new conversation, or `200` with the existing one |
 | `POST /api/v1/conversations/group` | `name`, `memberIds` | `201` with the new conversation |
-| `GET /api/v1/conversations?page=0&size=20` | none | `200` with one page of the caller's conversations |
+| `GET /api/v1/conversations?page=0&size=20` or `?size=20&cursor=...` | none | `200` with one page of the caller's conversations |
 | `GET /api/v1/conversations/{conversationId}` | none | `200` with the conversation and its members |
+| `PUT /api/v1/conversations/{conversationId}/name` | `name` | `200` with the renamed conversation |
+| `DELETE /api/v1/conversations/{conversationId}` | none | `204`, no body |
 | `POST /api/v1/conversations/{conversationId}/members` | `userIds` | `200` with the updated conversation |
 | `DELETE /api/v1/conversations/{conversationId}/members/{userId}` | none | `204`, no body |
+| `POST /api/v1/conversations/{conversationId}/members/{userId}/promote` | none | `200` with the updated conversation |
+| `POST /api/v1/conversations/{conversationId}/members/{userId}/demote` | none | `200` with the updated conversation |
 | `POST /api/v1/conversations/{conversationId}/leave` | none | `204`, no body |
 
 ### Conversation types and roles
 
-- **Direct**: exactly two members and no name. Two users have at most one direct conversation: asking for it again, from either side, returns the existing one with `200`. Nobody can be added to, removed from or leave a direct conversation. Both members have the role `MEMBER`.
-- **Group**: a name that isn't blank and has at most 100 characters as sent (surrounding whitespace counts; characters outside the Basic Multilingual Plane, such as most emoji, count as two). It is stored without surrounding whitespace. The creator is always a member, with the role `ADMIN`. Everyone added at creation or later joins as `MEMBER`.
+- **Direct**: exactly two members and no name. Two users have at most one direct conversation: asking for it again, from either side, returns the existing one with `200`. Nobody can be added to, removed from or leave a direct conversation, and it can't be renamed or deleted. Both members have the role `MEMBER`.
+- **Group**: a name that isn't blank and has at most 100 characters as sent (surrounding whitespace counts; characters outside the Basic Multilingual Plane, such as most emoji, count as two). It is stored without surrounding whitespace. At most **100 members**, the creator included. The creator is always a member, with the role `ADMIN`. Everyone added at creation or later joins as `MEMBER`; administrators can promote members to `ADMIN` and demote them again.
 
 Members see each other's user ID, display name, role and join time. Email addresses are never included.
 
@@ -204,24 +208,43 @@ Members see each other's user ID, display name, role and join time. Email addres
 | Endpoint | Allowed for | Otherwise |
 |---|---|---|
 | Create direct | Any user. The recipient must exist and must not be the caller. | `400` |
-| Create group | Any user. All `memberIds` must exist. | `400` |
+| Create group | Any user. All `memberIds` must exist. | `400`; `409` if the group would have more than 100 members |
 | List | Any user. The list contains only conversations the caller is a member of. | |
 | Details | Members of the conversation | `404` |
-| Add members | Administrators of a group | `404` for non-members, `409` for direct conversations, `403` for members who aren't administrators |
+| Rename, delete | Administrators of a group | `404` for non-members, `409` for direct conversations, `403` for members who aren't administrators |
+| Add members | Administrators of a group | `404` for non-members, `409` for direct conversations, `403` for members who aren't administrators, `409` past the member limit |
 | Remove member | Yourself: any member of a group (the same as leaving). Someone else: administrators of the group. | `404` for non-members, `409` for direct conversations, `403` for members who aren't administrators, `404` if the user to remove isn't a member |
+| Promote, demote | Administrators of a group | `404` for non-members, `409` for direct conversations, `403` for members who aren't administrators, `404` if the user isn't a member, `409` for an invalid role change |
 | Leave | Members of a group | `404` for non-members, `409` for direct conversations |
 
-- **Non-members can't tell a conversation exists.** A conversation the caller doesn't belong to gets exactly the same `404` as an ID that doesn't exist, on every endpoint. Guessing IDs reveals nothing.
-- Checks run in this order: membership, then conversation type, then role, then the request's user IDs. Only members ever get a `403` or `409`, and they already know the conversation.
+- **Non-members can't tell a conversation exists.** A conversation the caller doesn't belong to gets exactly the same `404` as an ID that doesn't exist, on every endpoint. Guessing IDs reveals nothing. A deleted group has no members, so it gets that `404` too.
+- Checks run in this order: membership, then conversation type, then role, then the request's user IDs, then the state of the group (member limit, role changes). Only members ever get a `403` or `409`, and they already know the conversation.
 - Membership is checked in the database on every request, so a removed member loses access immediately.
 
 ### Membership rules
 
 - **Adding** users who are already members does nothing for them; the others are added. Repeating a request is therefore harmless and returns `200`. If any of the IDs doesn't exist, the request fails with `400` and nobody is added.
+- **Member limit**: a group has at most 100 members, its creator included. Creating a group with the creator and more than 99 others, or adding users who would take a group past 100, fails with `409` and adds nobody: a request is never partly applied. Duplicate IDs and users who are already members don't count. Adding only existing members still succeeds in a full group, because it changes nothing. A place freed by someone leaving can be taken again.
 - **Removing**: administrators can remove any other member, including other administrators.
-- **Leaving** (or removing yourself) is open to every member. When the group's last administrator leaves, the longest-standing remaining member (earliest `joinedAt`, ties broken by user ID) becomes `ADMIN`. A group with members therefore always has an administrator. There is no endpoint to promote members yet, so in practice a group has exactly one administrator.
-- When the **last member** leaves, the group stays in the database without members. Nobody can see or rejoin it.
-- Adding, removing and leaving update the conversation's `updatedAt`, which moves it to the top of its members' lists.
+- **Roles**: administrators can promote any member to `ADMIN` and demote any administrator, themselves included, to `MEMBER`. A group can have several administrators, and they all have the same rights. Promoting someone who is already an administrator, or demoting someone who isn't, is a `409`: the request asks for a change that doesn't apply.
+- **A group always has an administrator.** The last administrator can't demote themselves (`409`); they promote someone else first. Administrators who demote or remove *others* stay administrators themselves, so they can't remove the last one.
+- **Leaving** (or removing yourself) is open to every member. To choose a successor, the last administrator promotes them before leaving. Otherwise the longest-standing remaining member (earliest `joinedAt`, ties broken by user ID) becomes `ADMIN` automatically when the last administrator leaves.
+- Adding, removing, leaving, promoting, demoting and renaming update the conversation's `updatedAt`, which moves it to the top of its members' lists. Requests that change nothing (adding existing members, renaming to the current name) don't.
+
+### Group lifecycle
+
+A group is **active** from its creation until it is **deleted**. Active groups always have at least one member and at least one administrator.
+
+A group is deleted in one of two ways:
+
+- An administrator deletes it: `DELETE /api/v1/conversations/{conversationId}`.
+- Its last member leaves (or removes themselves).
+
+Deletion is the same in both cases. In one transaction, all memberships are removed and the conversation is marked deleted (`deleted_at`). For its former members, the group is gone: it disappears from their lists, and every request about it gets `404`, the same as for a conversation that never existed. Nobody can rejoin, rename or restore it; there is no endpoint to undo a deletion.
+
+The conversation row itself is kept, with its name, creator and timestamps. Nothing in the API returns it again. It is kept so that records that refer to the conversation don't have to be deleted with it, or left pointing at nothing. Messages will be such records, once they exist. Memberships are removed because membership is what grants access, and because the schema already treats them as disposable: leaving has always deleted the membership row. No other data is removed.
+
+Groups whose last member left before this behavior existed were stored without members. Migration `V3` marks them deleted, with the time the last member left.
 
 ### Examples
 
@@ -254,8 +277,10 @@ curl 'http://localhost:8080/api/v1/conversations?page=0&size=20' -H 'Authorizati
 ```
 
 ```json
-{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1}}
+{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
 ```
+
+`nextCursor` is `null` here because the list has no more entries. See [Pagination](#pagination).
 
 Get one conversation (same body as the creation responses):
 
@@ -281,16 +306,58 @@ Leave a group:
 curl -i -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/leave -H 'Authorization: Bearer <accessToken>'
 ```
 
+Promote a member to administrator, or demote an administrator (administrators only). Both return the conversation with its updated members:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/members/9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c/promote -H 'Authorization: Bearer <accessToken>'
+```
+
+```bash
+curl -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/members/9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c/demote -H 'Authorization: Bearer <accessToken>'
+```
+
+Rename a group (administrators only). The name follows the same rules as at creation. Returns the conversation:
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/name -H 'Authorization: Bearer <accessToken>' -H 'Content-Type: application/json' -d '{"name": "Long Weekend Plans"}'
+```
+
+Delete a group (administrators only). See [Group lifecycle](#group-lifecycle):
+
+```bash
+curl -i -X DELETE http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d -H 'Authorization: Bearer <accessToken>'
+```
+
 ### Pagination
 
-`GET /api/v1/conversations` is paginated with Spring Data's parameters:
+`GET /api/v1/conversations` returns the caller's conversations in a fixed order: most recently updated first (`updatedAt` descending), then by `id` descending. The ID is unique, so conversations updated at the same moment always come in the same order, on every request and in both pagination modes. A `sort` parameter is ignored. Deleted groups are never listed or counted.
+
+There are two ways to page through the list. Cursors are the better choice for scrolling; page numbers remain for existing clients and for jumping to a page.
+
+**By cursor** (recommended):
+
+1. Request the first page without a cursor: `?size=20`.
+2. The response's `nextCursor` marks where that page ended. Request the next page with `?size=20&cursor=<nextCursor>`.
+3. Repeat until `nextCursor` is `null`: there are no more entries.
+
+- A cursor is an opaque string. Don't build or change one; pass back what the server returned. An invalid cursor is a `400`.
+- With a cursor, `page` is ignored, and the response's `page` is `null`: page numbers and totals don't apply. `content` and `nextCursor` are as usual.
+- An empty `cursor=` counts as no cursor, so it returns the first page.
+
+**By page number**:
 
 - `page`: zero-based page number, default `0`.
-- `size`: entries per page, default `20`, at most `100` (larger values are reduced to 100). Invalid values fall back to the defaults.
-- The order is fixed: most recently updated first (`updatedAt` descending), then by `id` descending, so conversations updated at the same moment always come in the same order. A `sort` parameter is ignored.
-- The response has the entries in `content` and the page metadata in `page`: `size`, `number`, `totalElements`, `totalPages`. A page past the end has an empty `content`.
+- The response has the page metadata in `page`: `size`, `number`, `totalElements`, `totalPages`. A page past the end has an empty `content`.
+- `nextCursor` is set too, so a client can start by page number and continue by cursor.
 
-Pages are offsets into the current order. If a conversation changes between two requests, it moves to the top, and later pages shift by one: an entry can appear twice or be skipped. Clients that need an exact view should reload from page `0`.
+**In both modes**, `size` is the number of entries per page: default `20`, at most `100` (larger values are reduced to 100). Invalid values fall back to the defaults.
+
+**When conversations change while a client pages through the list:**
+
+- **Page numbers** are offsets into the current order. When a conversation from a later page moves to the top, a new one appears, or one disappears, later pages shift by one: an entry can appear twice or be skipped.
+- **Cursors** are a position in the order, not an offset, so these changes don't shift the following entries. No entry appears twice, and no entry is skipped because others moved. Conversations that are deleted or left before the client reaches them simply don't appear.
+- A conversation that is created or changes during the pass sorts at the top of the list, before the cursor. It doesn't appear on the following pages. The client sees it when it reloads the first page.
+- A cursor doesn't freeze the list in time. Each page shows the conversations as they are when that page is requested, so all pages together aren't a snapshot of a single moment.
 
 ### Errors
 
@@ -300,35 +367,48 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 |---|---|---|
 | Invalid body: missing `recipientId`, blank or too long `name`, missing `memberIds`, empty `userIds`, more than 100 IDs, a `null` ID | `400` | `errors` lists each invalid field, e.g. `memberIds[1]` |
 | Malformed UUID in the path or body | `400` | |
+| Invalid `cursor` | `400` | |
 | Direct conversation with yourself | `400` | |
 | User IDs in the body that don't exist | `400` | `userIds` lists them. Nothing is created or added. |
 | Missing, malformed, expired or wrongly signed access token | `401` | |
-| Adding or removing others without being an administrator | `403` | |
-| Conversation doesn't exist, or the caller isn't a member | `404` | Identical response in both cases |
-| The user to remove isn't a member | `404` | |
-| Adding, removing or leaving in a direct conversation | `409` | |
+| Adding or removing others, changing roles, renaming or deleting without being an administrator | `403` | |
+| Conversation doesn't exist, was deleted, or the caller isn't a member | `404` | Identical response in all cases |
+| The user to remove, promote or demote isn't a member | `404` | |
+| Adding, removing, leaving, changing roles, renaming or deleting in a direct conversation | `409` | |
+| The group would have more than 100 members | `409` | `maxMembers` is the limit. Nobody is added. |
+| Promoting an administrator, demoting a member, or demoting the last administrator | `409` | |
 
 ```json
 {"type":"about:blank","title":"Bad Request","status":400,"detail":"Some users do not exist.","instance":"/api/v1/conversations/group","userIds":["0e8f6a1c-55d4-4c3a-9b7e-2f1d0c9b8a7e"]}
 ```
 
-Unknown users in the body are a `400`, not a `404`: the endpoint exists, the request refers to something that doesn't.
+```json
+{"type":"about:blank","title":"Conflict","status":409,"detail":"A group can have at most 100 members.","instance":"/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/members","maxMembers":100}
+```
+
+Unknown users in the body are a `400`, not a `404`: the endpoint exists, the request refers to something that doesn't. The member limit is a `409` both when creating a group and when adding members: the request is well-formed, but the group it would produce isn't allowed.
 
 ### Design decisions
 
 - **One direct conversation per pair, also under concurrency.** The two participants are stored on the conversation row (`direct_user1_id`, `direct_user2_id`), in a fixed order, under a unique constraint. Two simultaneous requests for the same pair can both find no conversation, but only one insert succeeds; the other request then reads the conversation the first one created and returns it with `200`.
-- **Membership changes are serialized per conversation.** Adding, removing and leaving lock the conversation row first, after checking that the caller is a member, so outsiders can't hold the lock. Concurrent changes to the same group therefore run one after the other: the same user can't be added twice, and the last administrator leaving at the same time as the member who would replace them can't leave a group without an administrator.
-- **Transactions.** Creating a conversation and its memberships, and each membership change with the `updatedAt` it touches, happen in one transaction: they are stored completely or not at all.
-- **Delete behavior.** Users who created or belong to a conversation can't be deleted (foreign keys with `on delete restrict`): there is no account deletion yet, and when there is, it has to decide what happens to the user's conversations explicitly. Memberships are deleted together with their conversation (`on delete cascade`); nothing in the application deletes conversations yet.
-- **Indexes.** `conversation_members (user_id, conversation_id)` serves the conversation list and its count; the unique constraint on `(conversation_id, user_id)` serves every lookup by conversation (members, member counts, membership checks); the unique constraint on the direct pair serves the duplicate check. The query plans were checked against seeded data; no other index is needed for these queries.
+- **Changes to a group are serialized per conversation.** Adding, removing, leaving, promoting, demoting, renaming and deleting lock the conversation row first (`SELECT ... FOR NO KEY UPDATE`), after checking that the caller is a member, so outsiders can't hold the lock. Concurrent changes to the same group therefore run one after the other, and each one reads the members the previous one left. This is what keeps the rules true under concurrency:
+  - The same user can't be added twice. The unique constraint on `(conversation_id, user_id)` backs this up in the database.
+  - The member limit holds. The member count is read after the lock is taken, so two requests that would each fit on their own can't together exceed 100. A plain count followed by an insert, without the lock, could.
+  - A group keeps an administrator. Two administrators demoting themselves at once, or the last administrator leaving while the member who would replace them leaves too, run one after the other, and the second one sees the result of the first.
+  - Members added at the same moment as the group is deleted don't survive the deletion: either the addition runs first and the deletion removes them, or the deletion runs first and the addition gets `404`.
+  - Creating a group needs no lock. Nobody else can see the group, or add members to it, before the creating transaction commits.
+- **Transactions.** Creating a conversation and its memberships, each membership or role change with the `updatedAt` it touches, and a deletion (removing the memberships and marking the conversation deleted) each happen in one transaction: they are stored completely or not at all.
+- **Delete behavior.** Groups are deleted by marking them (see [Group lifecycle](#group-lifecycle)), not by removing the row, so nothing that refers to a conversation has to be removed with it. Users who created or belong to a conversation can't be deleted (foreign keys with `on delete restrict`): there is no account deletion yet, and when there is, it has to decide what happens to the user's conversations explicitly. Memberships would be deleted together with their conversation row (`on delete cascade`), but nothing in the application deletes conversation rows.
+- **Stable pagination.** The list order ends with the conversation ID, a unique tie-breaker, so the order is total and the same on every request. A cursor stores the last entry's `updatedAt` and `id`, and the next page selects the entries that sort after that pair (`updatedAt < t or (updatedAt = t and id < i)`, in PostgreSQL's UUID order). Cursors were added alongside page numbers rather than replacing them, so existing clients keep working: the response only gained the `nextCursor` field.
+- **Indexes.** `conversation_members (user_id, conversation_id)` serves the conversation list and its count; the unique constraint on `(conversation_id, user_id)` serves every lookup by conversation (members, member counts, membership checks); the unique constraint on the direct pair serves the duplicate check. The query plans were checked against seeded data; no other index is needed for these queries. A page by cursor reads and sorts the same rows as a page by number (the caller's memberships, joined to their conversations), so it adds no index either.
 
 ### Known limitations
 
-- No endpoints to promote or demote administrators, rename groups or delete conversations. Groups therefore have exactly one administrator.
-- No limit on group size, apart from at most 100 user IDs per request.
-- Groups whose last member left stay in the database.
-- Offset pagination: entries can shift between pages when conversations change (see [Pagination](#pagination)).
-- Conversation details and membership changes load all members of the conversation. That's cheap for chat-sized groups; very large groups would need paginated member lists.
+- Deleted groups stay in the database indefinitely. There is no retention period and no job that purges them.
+- Groups that had more than 100 members before the limit existed keep them. Nobody can be added to them until they are below the limit.
+- A conversation that changes while a client pages through the list by cursor moves before the cursor and isn't on the following pages (see [Pagination](#pagination)). Clients see it when they reload the first page.
+- Page numbers can still shift when conversations change. Use cursors to avoid that.
+- Conversation details and membership changes load all members of the conversation. That's cheap with at most 100 members.
 
 ## Run tests
 
@@ -359,15 +439,16 @@ To run only the authentication tests:
 | `AuthControllerIT` | Registration, email normalization, duplicate emails (also concurrent), validation errors, login, identical errors for wrong password and unknown email |
 | `RefreshTokenIT` | Rotation, hash-only storage, reuse detection, concurrent refreshes, expired and unknown tokens, logout behavior |
 | `UserControllerIT` | `/api/v1/users/me` with valid, missing, malformed, expired, wrongly signed, wrong-issuer and wrong-audience tokens |
-| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior |
+| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3 |
 | `DirectPairTest` (unit) | Ordering of a direct conversation's participants the way PostgreSQL orders UUIDs |
-| `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing and pagination, access control (`401`, `403`, `404` for non-members), adding and removing members, leaving and the administrator hand-over |
-| `ConversationServiceIT` | Concurrent creation of the same direct conversation, concurrent adds and leaves (the conversation lock), rollback when a membership insert fails, agreement with PostgreSQL's UUID order |
+| `ConversationCursorTest` (unit) | Encoding and decoding of list cursors; rejection of cursors the server didn't issue |
+| `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing, pagination by number and by cursor (equal timestamps, changes between pages, invalid cursors), access control (`401`, `403`, `404` for non-members), adding and removing members, the member limit, promoting and demoting (last administrator, invalid changes), renaming, deleting, leaving, the administrator hand-over and the deletion of groups whose last member leaves |
+| `ConversationServiceIT` | Concurrent creation of the same direct conversation; under the conversation lock: concurrent adds of the same user, concurrent adds near the member limit, concurrent leaves, administrators demoting themselves at once, deletion during an addition, the last two members leaving at once; rollback when a membership insert fails or a deletion can't be completed; agreement with PostgreSQL's UUID order |
 
 To run only the conversation tests:
 
 ```bash
-./mvnw verify -Dtest=DirectPairTest -Dit.test='ConversationControllerIT,ConversationServiceIT,DatabaseSchemaIT'
+./mvnw verify -Dtest='DirectPairTest,ConversationCursorTest' -Dit.test='ConversationControllerIT,ConversationServiceIT,DatabaseSchemaIT'
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push to `main` and on every pull request.
@@ -386,10 +467,11 @@ Rules:
 
 Existing migrations:
 
-| Version | Creates |
+| Version | Changes |
 |---|---|
-| `V1__create_users_and_refresh_tokens.sql` | `users`, `refresh_token_families`, `refresh_tokens` |
-| `V2__create_conversations.sql` | `conversations`, `conversation_members` |
+| `V1__create_users_and_refresh_tokens.sql` | Creates `users`, `refresh_token_families`, `refresh_tokens` |
+| `V2__create_conversations.sql` | Creates `conversations`, `conversation_members` |
+| `V3__add_group_lifecycle.sql` | Adds `conversations.deleted_at` with its checks; marks groups without members deleted |
 
 To see which migrations have been applied to the local database:
 

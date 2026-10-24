@@ -54,6 +54,10 @@ class ConversationMember {
 		this.role = MemberRole.ADMIN;
 	}
 
+	void demoteToMember() {
+		this.role = MemberRole.MEMBER;
+	}
+
 	UUID getId() {
 		return id;
 	}

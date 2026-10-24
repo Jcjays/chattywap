@@ -1,14 +1,14 @@
 package com.adonis.chattywap.conversation;
 
 import com.adonis.chattywap.conversation.dto.AddMembersRequest;
+import com.adonis.chattywap.conversation.dto.ConversationPageResponse;
 import com.adonis.chattywap.conversation.dto.ConversationResponse;
-import com.adonis.chattywap.conversation.dto.ConversationSummaryResponse;
 import com.adonis.chattywap.conversation.dto.CreateDirectConversationRequest;
 import com.adonis.chattywap.conversation.dto.CreateGroupConversationRequest;
 import com.adonis.chattywap.conversation.dto.DirectConversationResult;
+import com.adonis.chattywap.conversation.dto.RenameGroupRequest;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.web.PagedModel;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
@@ -16,8 +16,10 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -60,16 +62,34 @@ class ConversationController {
 	/**
 	 * Spring Data binds {@code ?page=0&size=20} to the {@link Pageable}; the size is capped at
 	 * {@code spring.data.web.pageable.max-page-size}. The order is fixed, so a {@code sort} parameter is ignored.
+	 * With a {@code cursor}, the page starts after it and {@code page} is ignored. An empty cursor counts as none,
+	 * for clients that always send the parameter.
 	 */
 	@GetMapping
-	PagedModel<ConversationSummaryResponse> list(Pageable pageable, Authentication authentication) {
-		return new PagedModel<>(conversationService.listConversations(currentUserId(authentication),
-				pageable.getPageNumber(), pageable.getPageSize()));
+	ConversationPageResponse list(Pageable pageable, @RequestParam(required = false) String cursor,
+			Authentication authentication) {
+		UUID callerId = currentUserId(authentication);
+		if (cursor == null || cursor.isEmpty()) {
+			return conversationService.listConversations(callerId, pageable.getPageNumber(), pageable.getPageSize());
+		}
+		return conversationService.listConversationsAfter(callerId, cursor, pageable.getPageSize());
 	}
 
 	@GetMapping("/{conversationId}")
 	ConversationResponse get(@PathVariable UUID conversationId, Authentication authentication) {
 		return conversationService.getConversation(currentUserId(authentication), conversationId);
+	}
+
+	@PutMapping("/{conversationId}/name")
+	ConversationResponse rename(@PathVariable UUID conversationId, @Valid @RequestBody RenameGroupRequest request,
+			Authentication authentication) {
+		return conversationService.renameGroup(currentUserId(authentication), conversationId, request.name());
+	}
+
+	@DeleteMapping("/{conversationId}")
+	@ResponseStatus(HttpStatus.NO_CONTENT)
+	void delete(@PathVariable UUID conversationId, Authentication authentication) {
+		conversationService.deleteGroup(currentUserId(authentication), conversationId);
 	}
 
 	@PostMapping("/{conversationId}/members")
@@ -82,6 +102,18 @@ class ConversationController {
 	@ResponseStatus(HttpStatus.NO_CONTENT)
 	void removeMember(@PathVariable UUID conversationId, @PathVariable UUID userId, Authentication authentication) {
 		conversationService.removeMember(currentUserId(authentication), conversationId, userId);
+	}
+
+	@PostMapping("/{conversationId}/members/{userId}/promote")
+	ConversationResponse promote(@PathVariable UUID conversationId, @PathVariable UUID userId,
+			Authentication authentication) {
+		return conversationService.promoteToAdmin(currentUserId(authentication), conversationId, userId);
+	}
+
+	@PostMapping("/{conversationId}/members/{userId}/demote")
+	ConversationResponse demote(@PathVariable UUID conversationId, @PathVariable UUID userId,
+			Authentication authentication) {
+		return conversationService.demoteToMember(currentUserId(authentication), conversationId, userId);
 	}
 
 	@PostMapping("/{conversationId}/leave")
