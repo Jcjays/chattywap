@@ -20,6 +20,17 @@ spring:
     username: ${RABBITMQ_USERNAME}
     password: ${RABBITMQ_PASSWORD}
 
+chattywap:
+  auth:
+    # Base64-encoded HMAC key that signs access tokens; at least 32 bytes once decoded.
+    # Required, no default: generate one with `openssl rand -base64 32`.
+    jwt-secret: ${JWT_SECRET}
+    jwt-issuer: ${JWT_ISSUER:chattywap}
+    jwt-audience: ${JWT_AUDIENCE:chattywap-api}
+    # Durations accept units such as 30s, 15m, 12h, 30d.
+    access-token-ttl: ${JWT_ACCESS_TOKEN_TTL:15m}
+    refresh-token-ttl: ${REFRESH_TOKEN_TTL:30d}
+
 management:
   endpoints:
     web:

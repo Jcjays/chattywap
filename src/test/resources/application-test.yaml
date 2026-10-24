@@ -1,0 +1,6 @@
+# Settings for integration tests, activated with @ActiveProfiles("test").
+
+chattywap:
+  auth:
+    # Base64 of "test-only-signing-key-for-integration-tests". Known to everyone: never use it outside tests.
+    jwt-secret: dGVzdC1vbmx5LXNpZ25pbmcta2V5LWZvci1pbnRlZ3JhdGlvbi10ZXN0cw==

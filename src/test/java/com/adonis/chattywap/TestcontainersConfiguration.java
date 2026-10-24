@@ -9,9 +9,10 @@ import org.testcontainers.utility.DockerImageName;
 
 /**
  * PostgreSQL and RabbitMQ containers for integration tests. Image versions match compose.yaml.
+ * Public so that integration tests in the feature packages can import it.
  */
 @TestConfiguration(proxyBeanMethods = false)
-class TestcontainersConfiguration {
+public class TestcontainersConfiguration {
 
 	@Bean
 	@ServiceConnection
