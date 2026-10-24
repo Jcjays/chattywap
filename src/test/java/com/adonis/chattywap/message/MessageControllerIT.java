@@ -127,6 +127,27 @@ class MessageControllerIT {
 	}
 
 	@Test
+	void messagesAreNumberedOneAfterTheOtherInEachConversation() {
+		TestUser alice = createUser("Alice");
+		TestUser bob = createUser("Bob");
+		UUID group = createGroup(alice, bob);
+		UUID otherGroup = createGroup(alice, bob);
+
+		List<Long> numbers = new ArrayList<>();
+		for (TestUser sender : List.of(alice, bob, alice)) {
+			numbers.add(json(send(sender, group, "Hello")).get("sequenceNumber").asLong());
+		}
+		long otherFirst = json(send(bob, otherGroup, "Elsewhere")).get("sequenceNumber").asLong();
+
+		assertThat(numbers).containsExactly(1L, 2L, 3L);
+		// Every conversation starts at 1.
+		assertThat(otherFirst).isEqualTo(1);
+		// The history shows the same numbers, newest first.
+		assertThat(get(bob, messages(group))).bodyJson().extractingPath("$.content[*].sequenceNumber").asArray()
+				.containsExactly(3, 2, 1);
+	}
+
+	@Test
 	void theSenderIsAlwaysTheTokensUser() {
 		TestUser alice = createUser("Alice");
 		TestUser bob = createUser("Bob");
@@ -569,8 +590,8 @@ class MessageControllerIT {
 		// The other conversation has messages at exactly the same times, which must never show up.
 		for (UUID conversationId : List.of(group, otherGroup)) {
 			jdbcTemplate.update("""
-					insert into messages (id, conversation_id, sender_id, content, created_at)
-					select gen_random_uuid(), ?, case when n % 2 = 0 then ? else ? end, 'Message ' || n,
+					insert into messages (id, conversation_id, sequence_number, sender_id, content, created_at)
+					select gen_random_uuid(), ?, n, case when n % 2 = 0 then ? else ? end, 'Message ' || n,
 					       timestamptz '2026-10-24 10:00:00Z' - (n / 5) * interval '1 second'
 					from generate_series(1, 137) n
 					""", conversationId, alice.id(), bob.id());
@@ -630,8 +651,8 @@ class MessageControllerIT {
 		UUID group = createGroup(alice);
 		// 102 messages, inserted directly because sending them one request at a time is slow.
 		jdbcTemplate.update("""
-				insert into messages (id, conversation_id, sender_id, content, created_at)
-				select gen_random_uuid(), ?, ?, 'Message ' || n, now() - n * interval '1 second'
+				insert into messages (id, conversation_id, sequence_number, sender_id, content, created_at)
+				select gen_random_uuid(), ?, n, ?, 'Message ' || n, now() - n * interval '1 second'
 				from generate_series(1, 102) n
 				""", group, alice.id());
 

@@ -36,7 +36,7 @@ import java.util.regex.Pattern;
  * like on every REST request, by Spring Security's {@link JwtAuthenticationProvider} with the application's
  * {@link JwtDecoder} (signature, expiry, issuer, audience), and its user becomes the connection's user: the
  * {@code Principal} of every later frame. User IDs or logins sent by the client are never used.</li>
- * <li><b>SUBSCRIBE</b> is allowed to a conversation's messages topic for its members, as decided by
+ * <li><b>SUBSCRIBE</b> is allowed to a conversation's messages topic and receipts topic for its members, as decided by
  * {@link ConversationService#requireMembership}, and to the connection's own error queue. Nothing else.</li>
  * <li><b>SEND</b> is allowed to the destination where members post a conversation's messages. Whether the user may
  * post to that conversation is decided by {@code MessageService}, like for REST. Sending to a broker destination,
@@ -175,7 +175,10 @@ class StompSecurityInterceptor implements ChannelInterceptor {
 		if (ERRORS_SUBSCRIPTION.equals(destination)) {
 			return;
 		}
-		conversationService.requireMembership(userId, conversationId(WebSocketConfig.MESSAGES_TOPIC, destination));
+		String topic = (destination != null && DESTINATIONS.match(WebSocketConfig.RECEIPTS_TOPIC, destination))
+				? WebSocketConfig.RECEIPTS_TOPIC
+				: WebSocketConfig.MESSAGES_TOPIC;
+		conversationService.requireMembership(userId, conversationId(topic, destination));
 	}
 
 	private void authorizeSend(StompHeaderAccessor frame) {

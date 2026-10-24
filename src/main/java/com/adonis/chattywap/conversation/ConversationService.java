@@ -91,15 +91,21 @@ public class ConversationService {
 
 	private final UserService userService;
 
+	private final UnreadMessageCounter unreadMessageCounter;
+
 	/** Always starts a new transaction, even if the caller already has one: see {@link #createDirectConversation}. */
 	private final TransactionTemplate newTransaction;
 
+	/**
+	 * @param unreadMessageCounter the {@code message} feature's unread counts, for the conversation list
+	 */
 	public ConversationService(ConversationRepository conversationRepository,
 			ConversationMemberRepository memberRepository, UserService userService,
-			PlatformTransactionManager transactionManager) {
+			UnreadMessageCounter unreadMessageCounter, PlatformTransactionManager transactionManager) {
 		this.conversationRepository = conversationRepository;
 		this.memberRepository = memberRepository;
 		this.userService = userService;
+		this.unreadMessageCounter = unreadMessageCounter;
 		this.newTransaction = new TransactionTemplate(transactionManager);
 		this.newTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
 	}
@@ -190,6 +196,8 @@ public class ConversationService {
 	 * at the same moment are ordered by ID. Deleted groups are left out. The order is fixed, so a page always
 	 * starts where the previous one ended as long as no conversation changes in between. The response's
 	 * {@code nextCursor} continues with {@link #listConversationsAfter}, which doesn't have that restriction.
+	 * <p>
+	 * Each entry has the caller's unread count, from {@link UnreadMessageCounter}.
 	 *
 	 * @param page zero-based page number
 	 */
@@ -249,6 +257,9 @@ public class ConversationService {
 				.map(conversation -> conversation.otherDirectUser(callerId))
 				.collect(Collectors.toSet());
 		Map<UUID, UserSummary> users = userService.findUserSummaries(otherUserIds);
+		// The caller's unread counts of all conversations on the page, in at most two queries.
+		Map<UUID, Long> unreadCounts = unreadMessageCounter.countUnread(callerId,
+				rows.stream().map(row -> row.conversation().getId()).toList());
 
 		return rows.stream().map(row -> {
 			Conversation conversation = row.conversation();
@@ -256,8 +267,8 @@ public class ConversationService {
 					? null
 					: requireUser(users, conversation.otherDirectUser(callerId));
 			return new ConversationSummaryResponse(conversation.getId(), conversation.getType(),
-					conversation.getName(), row.role(), row.memberCount(), otherUser, conversation.getCreatedAt(),
-					conversation.getUpdatedAt());
+					conversation.getName(), row.role(), row.memberCount(), unreadCounts.get(conversation.getId()),
+					otherUser, conversation.getCreatedAt(), conversation.getUpdatedAt());
 		}).toList();
 	}
 

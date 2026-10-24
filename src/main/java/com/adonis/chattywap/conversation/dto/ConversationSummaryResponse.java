@@ -14,6 +14,8 @@ import java.util.UUID;
  * @param name        the group's name; {@code null} for direct conversations
  * @param role        the caller's role in the conversation
  * @param memberCount how many members the conversation has, the caller included
+ * @param unreadCount how many messages others sent that the caller hasn't read, the same as the conversation's
+ *                    {@code unread-count} endpoint reports
  * @param otherUser   direct conversations: the other participant; {@code null} for groups
  */
 public record ConversationSummaryResponse(
@@ -22,6 +24,7 @@ public record ConversationSummaryResponse(
 		String name,
 		MemberRole role,
 		long memberCount,
+		long unreadCount,
 		UserSummary otherUser,
 		Instant createdAt,
 		Instant updatedAt) {

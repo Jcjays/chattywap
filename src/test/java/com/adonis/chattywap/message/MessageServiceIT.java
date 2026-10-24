@@ -20,6 +20,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -173,6 +174,8 @@ class MessageServiceIT {
 				// order in which the messages became visible.
 				assertThat(secondMessage.createdAt()).isAfter(firstMessage.createdAt());
 				assertThat(updatedAt(group)).isEqualTo(secondMessage.createdAt());
+				// And the next sequence number, read once the first message had committed.
+				assertThat(secondMessage.sequenceNumber()).isEqualTo(firstMessage.sequenceNumber() + 1);
 			}
 			finally {
 				commit.countDown();
@@ -218,6 +221,31 @@ class MessageServiceIT {
 	}
 
 	@Test
+	void concurrentMessagesGetConsecutiveSequenceNumbersInCommitOrder() throws Exception {
+		UUID alice = createUser();
+		UUID bob = createUser();
+		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+
+		List<MessageResponse> sent = runConcurrently(8,
+				attempt -> messageService.sendMessage(attempt % 2 == 0 ? alice : bob, group, "Message " + attempt));
+
+		List<MessageResponse> byNumber = sent.stream()
+				.sorted(Comparator.comparingLong(MessageResponse::sequenceNumber))
+				.toList();
+		// No number twice, none skipped.
+		assertThat(byNumber).extracting(MessageResponse::sequenceNumber)
+				.containsExactly(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L);
+		// Each message took its number, and its time, once the one before had committed.
+		for (int i = 1; i < byNumber.size(); i++) {
+			assertThat(byNumber.get(i).createdAt()).isAfterOrEqualTo(byNumber.get(i - 1).createdAt());
+		}
+		for (MessageResponse message : sent) {
+			assertThat(jdbcTemplate.queryForObject("select sequence_number from messages where id = ?", Long.class,
+					message.id())).isEqualTo(message.sequenceNumber());
+		}
+	}
+
+	@Test
 	void recordingActivityNeedsTheCallersTransaction() {
 		UUID alice = createUser();
 		UUID group = conversationService.createGroupConversation(alice, "Group", List.of()).id();
@@ -253,10 +281,10 @@ class MessageServiceIT {
 		assertThat(byNumberTen).isEqualTo(byNumberOne).isEqualTo(4);
 		assertThat(byCursorTen).isEqualTo(byCursorOne).isEqualTo(3);
 		// Sending: the membership check, the conversation lock, the membership check under the lock, the members (the
-		// message's recipients), the sender, the message, its outbox event and the conversation's activity time. One
-		// statement for the members, however many there are.
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(8);
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(8);
+		// message's recipients), the highest sequence number, the sender, the message, its outbox event and the
+		// conversation's activity time. One statement for the members, however many there are.
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(9);
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(9);
 	}
 
 	/**

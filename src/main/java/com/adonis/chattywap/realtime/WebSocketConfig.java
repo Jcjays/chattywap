@@ -23,8 +23,9 @@ import java.util.UUID;
  * clients authenticate in the STOMP CONNECT frame ({@link StompSecurityInterceptor}).</li>
  * <li>Client to server: members send a conversation's messages to {@code /app/conversations/{conversationId}/messages}
  * ({@link MessageStompController}).</li>
- * <li>Server to client: a conversation's messages on {@value #MESSAGES_TOPIC} ({@link MessageBroadcaster}), and the
- * errors of the connection's own messages on {@code /user/queue/errors}.</li>
+ * <li>Server to client: a conversation's messages on {@value #MESSAGES_TOPIC} and the changes of its receipts on
+ * {@value #RECEIPTS_TOPIC} ({@link MessageBroadcaster}), and the errors of the connection's own messages on
+ * {@code /user/queue/errors}.</li>
  * </ul>
  * The broker is Spring's simple in-memory broker. It delivers only to clients connected to this application instance
  * (see ARCHITECTURE.md, unresolved decision 1).
@@ -51,6 +52,9 @@ class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
 	/** Where members receive a conversation's messages. */
 	static final String MESSAGES_TOPIC = "/topic/conversations/{conversationId}/messages";
+
+	/** Where members receive the changes of a conversation's delivery and read receipts. */
+	static final String RECEIPTS_TOPIC = "/topic/conversations/{conversationId}/receipts";
 
 	/** Prefix of user destinations, which the server resolves to the connections of one user. */
 	static final String USER_PREFIX = "/user";
@@ -109,6 +113,11 @@ class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 	/** The destination where members receive the conversation's messages. */
 	static String messagesTopic(UUID conversationId) {
 		return MESSAGES_TOPIC.replace("{conversationId}", conversationId.toString());
+	}
+
+	/** The destination where members receive the changes of the conversation's receipts. */
+	static String receiptsTopic(UUID conversationId) {
+		return RECEIPTS_TOPIC.replace("{conversationId}", conversationId.toString());
 	}
 
 	/**

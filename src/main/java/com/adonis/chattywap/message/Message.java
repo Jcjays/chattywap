@@ -28,6 +28,10 @@ class Message {
 	@Column(name = "conversation_id", nullable = false, updatable = false)
 	private UUID conversationId;
 
+	// The message's position in its conversation: 1 for the first message, one more for each following one.
+	@Column(name = "sequence_number", nullable = false, updatable = false)
+	private long sequenceNumber;
+
 	@Column(name = "sender_id", nullable = false, updatable = false)
 	private UUID senderId;
 
@@ -40,8 +44,9 @@ class Message {
 	protected Message() {
 	}
 
-	Message(UUID conversationId, UUID senderId, String content, Instant createdAt) {
+	Message(UUID conversationId, long sequenceNumber, UUID senderId, String content, Instant createdAt) {
 		this.conversationId = conversationId;
+		this.sequenceNumber = sequenceNumber;
 		this.senderId = senderId;
 		this.content = content;
 		this.createdAt = createdAt;
@@ -53,6 +58,10 @@ class Message {
 
 	UUID getConversationId() {
 		return conversationId;
+	}
+
+	long getSequenceNumber() {
+		return sequenceNumber;
 	}
 
 	UUID getSenderId() {

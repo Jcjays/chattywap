@@ -278,10 +278,10 @@ curl 'http://localhost:8080/api/v1/conversations?page=0&size=20' -H 'Authorizati
 ```
 
 ```json
-{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
+{"content":[{"id":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","type":"GROUP","name":"Weekend Plans","role":"ADMIN","memberCount":3,"unreadCount":2,"otherUser":null,"createdAt":"2026-10-24T10:25:00.654321Z","updatedAt":"2026-10-24T10:25:00.654321Z"},{"id":"3c1e5a7b-2d4f-4a6c-8e0b-1f2a3b4c5d6e","type":"DIRECT","name":null,"role":"MEMBER","memberCount":2,"unreadCount":0,"otherUser":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"createdAt":"2026-10-24T10:20:00.123456Z","updatedAt":"2026-10-24T10:20:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
 ```
 
-`nextCursor` is `null` here because the list has no more entries. See [Pagination](#pagination).
+`nextCursor` is `null` here because the list has no more entries. See [Pagination](#pagination). `unreadCount` is how many messages others sent that the caller hasn't read, the same number `GET /api/v1/conversations/{conversationId}/unread-count` reports (see [Receipts and unread counts](#delivery-and-read-receipts-unread-counts)).
 
 Get one conversation (same body as the creation responses):
 
@@ -420,7 +420,7 @@ Members of a conversation can post messages to it and read its history. Both end
 | `POST /api/v1/conversations/{conversationId}/messages` | `content` | `201` with the stored message |
 | `GET /api/v1/conversations/{conversationId}/messages?page=0&size=20` or `?size=20&cursor=...` | none | `200` with one page of the history, newest message first |
 
-Clients connected over WebSocket also receive new messages as they are sent, and can send them that way too; see [Real-time messaging](#real-time-messaging-websocket-and-stomp). These endpoints stay the way to read the history. Read receipts, unread counts, editing, deleting, reactions, attachments and search are not part of this API yet.
+Clients connected over WebSocket also receive new messages as they are sent, and can send them that way too; see [Real-time messaging](#real-time-messaging-websocket-and-stomp). These endpoints stay the way to read the history. Delivery and read receipts and unread counts have endpoints of their own (see [Delivery and read receipts, unread counts](#delivery-and-read-receipts-unread-counts)). Editing, deleting, reactions, attachments and search are not part of this API yet.
 
 ### Content
 
@@ -450,7 +450,7 @@ curl -i -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c
 ```
 
 ```json
-{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}
 ```
 
 Read the history:
@@ -460,9 +460,10 @@ curl 'http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8
 ```
 
 ```json
-{"content":[{"id":"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"content":"Me!","createdAt":"2026-10-24T10:31:12.654321Z"},{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
+{"content":[{"id":"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":2,"sender":{"id":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","displayName":"Bob"},"content":"Me!","createdAt":"2026-10-24T10:31:12.654321Z"},{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}],"page":{"size":20,"number":0,"totalElements":2,"totalPages":1},"nextCursor":null}
 ```
 
+- `sequenceNumber` is the message's position in its conversation: `1` for the first message, one more for each following one, without gaps, in the order the messages were stored. Receipts refer to messages by it.
 - `sender` is the sender's user ID and display name. Email addresses are never included.
 - `createdAt` is when the server stored the message: UTC, ISO 8601, in microseconds. A history entry is identical to the response that sending it returned.
 
@@ -499,11 +500,12 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 
 ### Design decisions
 
-- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. There is no strict per-conversation sequence number: storing and paging history don't need one, and real-time delivery doesn't add one either (see [Order and delivery](#order-and-delivery) and `ARCHITECTURE.md`, unresolved decision 9).
+- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. The history keeps this order (see [Order and delivery](#order-and-delivery) and `ARCHITECTURE.md`, unresolved decision 9).
+- **Sequence numbers.** Every message also gets the next number of its conversation, read under the same conversation lock, so the numbers follow the order in which messages were stored on any number of instances, whatever their clocks say. A send that fails uses up no number, and messages are never deleted, so a conversation's numbers have no gaps. Receipts are positions in this order. A unique constraint on `(conversation_id, sequence_number)` catches a number given twice; its index, which includes the sender, also answers "the highest number" and unread counts. Existing messages were numbered in history order by migration V6.
 - **Membership checked under the conversation lock.** Sending takes the conversation lock that every group change takes, after checking that the sender is a member, checks the membership again under the lock, stores the message and moves the conversation's `updatedAt` to the message's time, all in one transaction. Leaving, removal and group deletion wait for a message that is being sent, and a message sent while one of them is in progress waits for it and is then rejected. Taking the conversation lock first, like every group change, also means sends and group changes can't deadlock. Reading the history takes no lock: a read at the same moment as a removal sees the membership from before or after it.
 - **Conversation activity.** Sending a message moves the conversation's `updatedAt`, its activity time, to the message's `createdAt`, so the conversation moves to the top of its members' lists. The update is part of the message's transaction: if storing the message fails, `updatedAt` keeps its old value. `updatedAt` is reused rather than adding a separate field, so the conversation list's order, cursors and JSON stay as they were; `updatedAt` simply also counts messages as activity now. It has no index, so updating it on every message touches no index.
 - **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Only after the commit is the message delivered to connected members (see [Real-time messaging](#real-time-messaging-websocket-and-stomp)), so a message that couldn't be stored is never delivered.
-- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes eight statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, sender, insert, its outbox event, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
+- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes nine statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, the conversation's highest sequence number, sender, insert, its outbox event, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
 - **Pagination in the database.** Pages use `FETCH FIRST`, and `OFFSET` for page numbers. A page by cursor selects the messages that sort after the cursor with a row comparison, `(created_at, id) < (t, i)`, which PostgreSQL uses as the start of the index scan. The equivalent `created_at < t or (created_at = t and id < i)` filters every newer message instead.
 - **Indexes.** One new index, `messages (conversation_id, created_at, id)`. PostgreSQL reads it backwards for the newest-first order, so pages need no sort. Checked against 1,000,000 messages, 200,000 of them in one conversation: the first page and a cursor page 100,000 messages deep each read a handful of index pages in under 0.1 ms. Membership checks use the existing membership indexes. There is no index on `sender_id`: nothing looks messages up by sender, and users can't be deleted, so it would only slow down inserts.
 - **Database constraints.** Foreign keys to the conversation and the sender (`on delete restrict`: a conversation or a user with messages can't be deleted; nothing in the application deletes either); `content` is `varchar(4000)` and can't be empty or only ASCII whitespace. The API's checks are stricter, so the database constraints only catch bugs.
@@ -528,6 +530,7 @@ The WebSocket only delivers messages sent while a client is connected. The histo
 | Authenticate | `Authorization: Bearer <accessToken>` header in the STOMP `CONNECT` frame |
 | Send a message | `SEND` to `/app/conversations/{conversationId}/messages`, body `{"content": "..."}` |
 | Receive a conversation's messages | `SUBSCRIBE` to `/topic/conversations/{conversationId}/messages` |
+| Receive changes of a conversation's delivery and read receipts | `SUBSCRIBE` to `/topic/conversations/{conversationId}/receipts` (see [Receipts](#delivery-and-read-receipts-unread-counts)) |
 | Receive the errors of your own messages | `SUBSCRIBE` to `/user/queue/errors` |
 
 In the frame examples below, `^@` stands for the NUL byte that ends every STOMP frame.
@@ -584,16 +587,16 @@ destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages
 content-type:application/json
 subscription:sub-0
 message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-0
-content-length:256
+content-length:275
 
-{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}^@
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sequenceNumber":1,"sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}^@
 ```
 
 Messages sent through REST and through STOMP arrive the same way, once each. The sender receives its own messages too, if it is subscribed.
 
 - **Only members can subscribe**, decided in the database at the moment of subscribing. A conversation the user isn't a member of, an unknown ID and a deleted group all get the same `ERROR` frame (`404`, `Conversation not found.`), and the server closes the connection. STOMP has no way to reject one subscription and keep the connection. Clients should subscribe only to conversations from their current list; to tell which subscription failed, add a `receipt` header to each `SUBSCRIBE`, which the `ERROR` frame repeats as `receipt-id`.
 - **Losing membership ends delivery.** A member who leaves or is removed keeps the subscription, but receives none of the messages sent after that, and subscribing again is rejected. Nobody is told; the client sees the change in the conversation list.
-- **Only these destinations** can be subscribed to. Patterns (`/topic/conversations/*/messages`), other users' queues and conversation IDs not written exactly as the API returns them (lower case, with hyphens) are rejected with `404` (`Unknown destination.`), and the connection is closed.
+- **Only these destinations** can be subscribed to, and a conversation's receipts topic under the same rules (see [Real-time receipt changes](#real-time-receipt-changes)). Patterns (`/topic/conversations/*/messages`), other users' queues and conversation IDs not written exactly as the API returns them (lower case, with hyphens) are rejected with `404` (`Unknown destination.`), and the connection is closed.
 - New conversations aren't announced over the WebSocket. A client subscribes to a conversation after creating it, or after it appears in the conversation list.
 
 ### Sending
@@ -690,9 +693,192 @@ Stopping at a known `id` relies on history order matching the order in which mes
 - Delivery order across senders can differ from the history order (see [Order and delivery](#order-and-delivery)).
 - No STOMP heartbeats from the server.
 
+## Delivery and read receipts, unread counts
+
+Members tell the server which messages their client has received and which they have read. Other members see it, live over the WebSocket and through REST, and every member can ask how many messages they haven't read. All endpoints require an access token; the member who acknowledges is always the user in the token.
+
+### What sent, delivered and read mean
+
+| Status of a message, for one member | Meaning | Recorded by |
+|---|---|---|
+| **Sent** | The message is stored in PostgreSQL: `POST .../messages` answered `201`, or it arrived over the WebSocket, which only happens after it was stored. | The server, when it stores the message |
+| **Delivered** | The member's client acknowledged that it received the message. | `POST .../receipts/delivered` from that member |
+| **Read** | The member reported reading the message. | `POST .../receipts/read` from that member |
+
+- Nothing else makes a message delivered: not a WebSocket broadcast, an open connection, a subscription, or the message's event reaching RabbitMQ. A client that received a message but never acknowledged it hasn't had it delivered, as far as the server knows.
+- Delivered never counts as read. Read does count as delivered: a member can only read what their client received, so reporting a read also acknowledges delivery up to the same message.
+- **Per member.** In a group, each member has their own positions. One member's acknowledgement says nothing about the others: "read by Bob" isn't "read by everyone".
+- The sender's own messages are never unread for the sender.
+
+### Positions
+
+Each member has two positions in a conversation: `lastDeliveredSequenceNumber` and `lastReadSequenceNumber`. They are message sequence numbers (`sequenceNumber` in every message), `0` if the member hasn't acknowledged anything. An acknowledgement names one message and covers it **and every earlier message** of the conversation, the member's own included, the way a read marker does.
+
+So for a message with sequence number `n` and a member `m`:
+
+- read by `m` if `n <= m.lastReadSequenceNumber`,
+- otherwise delivered to `m` if `n <= m.lastDeliveredSequenceNumber`,
+- otherwise only sent.
+
+Positions only move forward. Acknowledging the same message again, or an earlier one, changes nothing: the answer is `200` with the position as it is, and nobody is notified. Retries, duplicates and requests that arrive out of order are therefore harmless, also when they run at the same moment.
+
+### Endpoints
+
+| Method and path | Body | Success |
+|---|---|---|
+| `POST /api/v1/conversations/{conversationId}/receipts/delivered` | `messageId` | `200` with the caller's position |
+| `POST /api/v1/conversations/{conversationId}/receipts/read` | `messageId` | `200` with the caller's position |
+| `GET /api/v1/conversations/{conversationId}/receipts` | none | `200` with every member's position |
+| `GET /api/v1/conversations/{conversationId}/unread-count` | none | `200` with the caller's unread count |
+
+The conversation list (`GET /api/v1/conversations`) also has each entry's `unreadCount`.
+
+Acknowledge receiving everything up to a message:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts/delivered -H 'Authorization: Bearer <accessToken>' -H 'Content-Type: application/json' -d '{"messageId": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"}'
+```
+
+```json
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:31:13.000123Z","lastReadSequenceNumber":0,"readAt":null}
+```
+
+Report reading up to a message (`POST .../receipts/read`, same body): the answer has `lastReadSequenceNumber` `2` and `lastDeliveredSequenceNumber` at least `2`.
+
+Every member's positions:
+
+```bash
+curl http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts -H 'Authorization: Bearer <accessToken>'
+```
+
+```json
+{"members":[{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:31:20.000456Z","lastReadSequenceNumber":2,"readAt":"2026-10-24T10:31:20.000456Z"},{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","lastDeliveredSequenceNumber":0,"deliveredAt":null,"lastReadSequenceNumber":0,"readAt":null}]}
+```
+
+The caller's unread count:
+
+```bash
+curl http://localhost:8080/api/v1/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/unread-count -H 'Authorization: Bearer <accessToken>'
+```
+
+```json
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","unreadCount":3}
+```
+
+| Field | Meaning |
+|---|---|
+| `lastDeliveredSequenceNumber`, `lastReadSequenceNumber` | The last message the member acknowledged as received or read, with every message before it; `0` for none. The read position is never ahead of the delivered one. |
+| `deliveredAt`, `readAt` | When that position last moved forward, in microseconds; `null` if it never did. Never earlier than the time before, and `readAt` never earlier than the delivered time when it moved (an acknowledgement that waited for a concurrent one gets at least that one's time). |
+| `members` | Every current member, the caller included, ordered by user ID; members who haven't acknowledged anything have `0` and `null` |
+| `unreadCount` | Messages others sent after the caller's read position (see [Unread counts](#unread-counts)) |
+
+### When clients acknowledge
+
+- **Delivered**: after receiving messages, live or from the history, acknowledge the newest message up to which the client has **every** message. Sequence numbers start at `1` and have no gaps, so the client can tell: holding `1` to `7` and `9`, it acknowledges `7` and loads `8` from the history. One acknowledgement covers all earlier messages, so acknowledge once per burst (for example at most once a second), not once per message.
+- **Read**: when the user has seen messages, acknowledge the newest one on screen.
+- On a network error, send the same acknowledgement again: it's safe.
+- Only acknowledge what the client really has or the user really saw; the server can't check it.
+
+### Who can do what
+
+| Endpoint | Allowed for | Otherwise |
+|---|---|---|
+| Acknowledge delivered or read | Members of the conversation, for themselves | `404` (`Conversation not found.`) for non-members, former members, deleted groups and unknown conversations; `404` (`Message not found.`) if the message isn't one of the conversation's |
+| List receipts | Members of the conversation | `404` (`Conversation not found.`) |
+| Unread count | Members of the conversation | `404` (`Conversation not found.`) |
+
+- The member is always the token's user. A `userId` in the body or the query string is ignored: nobody can acknowledge for someone else or move someone else's position.
+- Membership is checked before the message, so non-members learn nothing about messages, not even whether an ID exists. A message of another conversation, even one the caller belongs to, gets the same `404` as an unknown ID.
+- **Every member sees every member's positions**, in direct conversations and groups alike: in a direct conversation, the sender sees that the other participant read their messages; in a group, who has read up to where. Positions show only user IDs, sequence numbers and times. Non-members see nothing.
+- A member who leaves or is removed loses their positions with the membership. Joining again starts without positions.
+
+### Unread counts
+
+A member's unread messages are the messages of the conversation that:
+
+1. someone else sent (the member's own never count), and
+2. come after the member's read position, by sequence number. A member who has never reported reading anything has no read position, so **every message others sent counts**, including messages sent before they joined.
+
+Acknowledging delivery doesn't change the count; only reading does. Counts are computed from PostgreSQL on every request, never stored, so they can't drift from the messages and positions, whatever order messages and read updates arrive in. The conversation list computes them the same way, two statements for a whole page, so its `unreadCount`s always agree with `GET .../unread-count`.
+
+Unread counts aren't pushed over the WebSocket. A client keeps its badge current from what it receives: a message from someone else with a sequence number after its read position adds one; a change of its own read position (from another device) is a reason to recompute or to call `GET .../unread-count`. After reconnecting, the REST counts are the truth.
+
+### Real-time receipt changes
+
+Subscribe to a conversation's receipts like to its messages, as a member:
+
+```
+SUBSCRIBE
+id:sub-1
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts
+
+^@
+```
+
+Whenever a member's delivered or read position moves forward, the connected members receive the member's new position, the same JSON as the REST answer:
+
+```
+MESSAGE
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/receipts
+content-type:application/json
+subscription:sub-1
+message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-2
+content-length:247
+
+{"conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","userId":"9b2d7c4e-1f0a-4c8e-b3d5-6a7e8f9a0b1c","lastDeliveredSequenceNumber":2,"deliveredAt":"2026-10-24T10:32:00.000789Z","lastReadSequenceNumber":2,"readAt":"2026-10-24T10:32:00.000789Z"}^@
+```
+
+- **Stored, then delivered.** A change is delivered after its transaction committed. One that couldn't be stored is never delivered.
+- **Only changes.** Repeated and outdated acknowledgements change nothing and deliver nothing. Each frame is the member's whole position, and positions only move forward: a client keeps the furthest it has seen per member, whatever order frames arrive in.
+- **Only current members** receive changes, the acknowledging member's own connections included, so their other devices learn of it. Members who left or were removed keep their subscription but receive nothing more, and subscribing again is rejected. The one exception: a change that commits at the same moment as a member's removal can still reach that member, because acknowledgements don't take the conversation lock. Every message it covers was sent before the removal. Non-members, unknown conversations and deleted groups get the same `ERROR` frame (`404`) as for the messages topic; patterns and other spellings of the ID get `404` (`Unknown destination.`).
+- **Best effort**, like messages: nothing is retried, and a client that wasn't connected catches up through REST.
+- Acknowledgements are sent through REST only, not as STOMP `SEND`s.
+
+### Reconnecting
+
+After connecting again (see [Missed messages and reconnecting](#missed-messages-and-reconnecting) for messages):
+
+1. Subscribe to each shown conversation's `messages` and `receipts` topics, then catch up the history.
+2. Load `GET .../receipts` for the conversations on screen, and the conversation list (or `GET .../unread-count`) for unread counts. Changes that arrive live meanwhile are merged by keeping each member's furthest position.
+3. Acknowledge delivery up to the newest message the client now has without gaps, and reading if the user sees the conversation.
+
+### Errors
+
+| Situation | Status | Notes |
+|---|---|---|
+| Missing or `null` `messageId` | `400` | `errors` lists `messageId` |
+| Malformed JSON, a malformed message ID or conversation ID | `400` | Rejected values are never echoed |
+| Missing, malformed, expired or wrongly signed access token | `401` | |
+| Conversation doesn't exist, was deleted, or the caller isn't (or is no longer) a member | `404` | `Conversation not found.`, identical in all cases |
+| The message doesn't exist or belongs to another conversation | `404` | `Message not found.`, identical in both cases |
+| Acknowledging a message at or before the current position | `200` | Not an error: the position is returned unchanged |
+| Unexpected server error, including a failure to store the position | `500` | Generic message. Nothing is stored or delivered. |
+
+### Design decisions
+
+- **Positions, not rows per message.** A member's receipts are two numbers per conversation, one row in `receipt_positions`, written only when they move. One row per message and recipient would mean up to 99 rows for every message in a full group, written whether or not anybody reads, and a cleanup. The price: a position can't say "received message 9 but not 8". Clients acknowledge only up to where they have everything, which sequence numbers without gaps make possible.
+- **Sequence numbers, not times.** Positions compare sequence numbers, which follow the order in which messages were stored on any number of instances. A position by time could be passed by a message that is stored later with an earlier time (application instances with different clocks), which would then never count as unread.
+- **Forward only, in one statement.** Each acknowledgement is one `insert ... on conflict do update ... where` statement that only moves the position forward. Concurrent acknowledgements of one member wait for each other's row lock, and the furthest wins whatever order they commit in. Acknowledgements take no conversation lock, so they never wait for messages being sent.
+- **Synchronous, without RabbitMQ.** The position is stored before the request returns, in a short transaction. Nothing consumes receipt changes asynchronously, so they produce no outbox event: an event with no queue for it would be returned by RabbitMQ and retried by the relay forever. Real-time delivery uses the same after-commit path as messages.
+- **Membership changes.** Membership is checked without a lock; a member removed at the same moment fails on the position's foreign key to the membership and gets the same `404` as any non-member. The same foreign key deletes positions with their membership.
+- **Counted, not stored.** Unread counts are counted when asked, from the index on `(conversation_id, sequence_number)`, which includes the sender: PostgreSQL reads only the index, and with a read position only the entries after it. A stored counter would have to be kept right through concurrent messages, reads, retries and membership changes, and reconciled when it isn't.
+- **Database constraints.** Positions must belong to a membership (cascade on delete) and name messages of the same conversation (foreign keys on the sequence number); the read position can't be ahead of the delivered one; a read position and its time come together.
+
+### Known limitations
+
+- **Without a read position, counting reads the whole history**: every message others sent counts, and PostgreSQL counts them in the index. Measured with 1,000,000 messages: with a read position, a count reads the unread entries only (0.1 ms); without one, about 35 ms for a conversation of 200,000 messages, and a conversation-list page of 100 conversations with 2,000 messages each and no read positions takes about 70–100 ms. Counts aren't capped.
+- **After upgrading, nobody has a read position**: all existing messages from others count as unread until members report reading. The migration doesn't mark them read, because that would show read receipts for messages nobody read.
+- **Members added to a group see its whole history as unread**, as they can read all of it.
+- **Visible to all members, no opt-out.** Every member sees every member's positions; members can't turn read receipts off.
+- **Fan-out in groups.** Every change goes to every connected member: in a group of 100, up to 100 frames per acknowledgement. Clients should batch delivery acknowledgements.
+- **One application instance** for live changes, like messages (see [Order and delivery](#order-and-delivery)).
+- **Unread counts aren't pushed**; clients derive them from what they receive (see [Unread counts](#unread-counts)).
+- **The server trusts the client's acknowledgements**: it can't check that a client really has the messages it acknowledges.
+- **Removal races.** A receipt change committing at the moment a member is removed can reach that member once; an acknowledgement in flight while a member is removed and added back lands in the new membership, which then doesn't start without a position. Both need the request and the membership change within milliseconds of each other.
+
 ## Asynchronous events (RabbitMQ and the transactional outbox)
 
-Every stored message also produces a durable `MessageCreated` event, published to RabbitMQ for asynchronous consumers such as push notifications, unread counts or analytics in later milestones. PostgreSQL stays the source of truth for messages and conversations; RabbitMQ carries events and is never read as message history.
+Every stored message also produces a durable `MessageCreated` event, published to RabbitMQ for asynchronous consumers such as push notifications or analytics in later milestones. Unread counts don't need it: they are counted in PostgreSQL. Receipt changes produce no event (see [Design decisions](#design-decisions-3)). PostgreSQL stays the source of truth for messages and conversations; RabbitMQ carries events and is never read as message history.
 
 The event is written to an outbox table in the same transaction as the message, and a relay publishes it to RabbitMQ after the commit. Sending a message never waits for RabbitMQ and works while it is down.
 
@@ -871,15 +1057,18 @@ To run only the authentication tests:
 | `AuthControllerIT` | Registration, email normalization, duplicate emails (also concurrent), validation errors, login, identical errors for wrong password and unknown email |
 | `RefreshTokenIT` | Rotation, hash-only storage, reuse detection, concurrent refreshes, expired and unknown tokens, logout behavior |
 | `UserControllerIT` | `/api/v1/users/me` with valid, missing, malformed, expired, wrongly signed, wrong-issuer and wrong-audience tokens |
-| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3; message foreign keys, blank and too long content, conversations and users with messages can't be deleted |
+| `DatabaseSchemaIT` | Migration constraints: unique and normalized email, foreign keys, cascading deletes, token-hash format; conversation types and roles, group and direct shape, unique ordered direct pair, unique membership, conversation foreign keys and delete behavior, only groups can be deleted; upgrading a V2 database to V3; message foreign keys, blank and too long content, conversations and users with messages can't be deleted; positive sequence numbers unique per conversation; upgrading a V5 database to V6 numbers existing messages in history order; receipt positions belong to a membership (removed with it) and name messages of their own conversation, read never ahead of delivered |
 | `DirectPairTest` (unit) | Ordering of a direct conversation's participants the way PostgreSQL orders UUIDs |
 | `KeysetCursorTest` (unit) | Encoding and decoding of list cursors (conversations and messages), a stable format; rejection of cursors the server didn't issue |
 | `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing, pagination by number and by cursor (equal timestamps, every conversation exactly once across pages of several sizes, changes between pages, invalid cursors), access control (`401`, `403`, `404` for non-members), adding and removing members, the member limit, promoting and demoting (last administrator, invalid changes), renaming, deleting, leaving, the administrator hand-over and the deletion of groups whose last member leaves |
 | `ConversationServiceIT` | Concurrent creation of the same direct conversation; under the conversation lock: concurrent adds of the same user, concurrent adds near the member limit, concurrent leaves, administrators demoting themselves at once, deletion during an addition, the last two members leaving at once; rollback when a membership insert fails or a deletion can't be completed; agreement with PostgreSQL's UUID order |
-| `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed commit is a `500` without details that changes nothing), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), sending moves the conversation to the top of the list while rejected messages don't, the history's order (equal timestamps), pagination by number and by cursor (every message exactly once across pages of several sizes, new messages between pages, size limit, invalid cursors), no messages from other conversations |
-| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times in commit order, while other conversations aren't held up; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders or members it has |
+| `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed commit is a `500` without details that changes nothing), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), sending moves the conversation to the top of the list while rejected messages don't, the history's order (equal timestamps), pagination by number and by cursor (every message exactly once across pages of several sizes, new messages between pages, size limit, invalid cursors), no messages from other conversations; sequence numbers from 1 in each conversation |
+| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times and sequence numbers in commit order, while other conversations aren't held up; concurrent messages get consecutive sequence numbers; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders or members it has |
+| `ReceiptControllerIT` | Receipts and unread counts through HTTP: acknowledging delivery and reading (covers earlier messages, read implies delivered, delivered isn't read), repeated and outdated acknowledgements change nothing, positions never move back, access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), a message of another conversation is `404` like an unknown one, the member is always the caller, validation, every member's positions, independent positions in groups, leaving removes a position; unread counts exclude the member's own messages, count after the read position or everything without one, go down as the position moves, and are the same in the conversation list (by number and by cursor) as for each conversation |
+| `ReceiptServiceIT` | An outdated acknowledgement waiting for a newer one doesn't move the position back; concurrent mixed acknowledgements end at the furthest positions; a member removed while acknowledging gets `404` and no position; a position whose transaction fails is neither stored nor announced, and receipts write no outbox events; only changes are announced, to the members at that moment; statements for unread counts per list page, however many conversations it has |
 | `StompSecurityIT` | Over a real WebSocket connection: `CONNECT` with a valid token (the connection's user), with malformed, wrongly signed, expired, wrong-issuer and wrong-audience tokens, and without a bearer token; a token on the handshake is ignored; frames before `CONNECT` and unsupported frames; other origins can't connect; the rest of HTTP still needs a token; members can subscribe, non-members, former members and deleted groups get the same `404` as unknown IDs; patterns, other users' queues and other destinations are rejected; removed members stop receiving; non-members can't send; sending to broker destinations is rejected; the sender is always the connection's user; no `SUBSCRIBE` or `SEND` after the token expired |
 | `StompMessagingIT` | Over real WebSocket connections: a message is stored before it is delivered, to every subscriber including the sender, with the stored ID and time and the same JSON as the history; a message whose commit fails is reported to the sender only and never delivered; messages reach only their own conversation's topic; each message is delivered once, sent through REST or STOMP; invalid and unreadable messages are answered on the error queue and the connection stays open; one connection's messages are stored and delivered in the order sent; concurrent senders: every message stored once, delivered once, each sender's order kept; messages missed while disconnected are in the history |
+| `StompReceiptsIT` | Over real WebSocket connections: a receipt change is stored before it is delivered, to every member including the acknowledging one, as the REST answer; acknowledgements that change nothing deliver nothing; changes reach only their own conversation's receipts topic; removed members stop receiving them and can't subscribe again; only members can subscribe, other destinations are rejected; a change whose commit fails is never delivered |
 
 | `OutboxRelayTest` (unit) | What the relay makes of each broker answer (acknowledged, rejected, returned, unconfirmed, unreachable); any failed send ends the batch, and so does the end of the time for sending; batches, shutdown, the retry delay |
 | `MessageCountConsumerTest` (unit) | Reading and validating events: unreadable, incomplete, other types and versions are rejected without processing; unknown fields are ignored |
@@ -903,10 +1092,16 @@ To run only the message tests:
 ./mvnw verify -Dtest='KeysetCursorTest' -Dit.test='MessageControllerIT,MessageServiceIT,DatabaseSchemaIT'
 ```
 
+To run only the receipt and unread-count tests:
+
+```bash
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='ReceiptControllerIT,ReceiptServiceIT,StompReceiptsIT,DatabaseSchemaIT'
+```
+
 To run only the real-time (WebSocket/STOMP) tests:
 
 ```bash
-./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT'
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT,StompReceiptsIT'
 ```
 
 To run only the asynchronous-event tests (outbox, relay, consumer):
@@ -938,6 +1133,8 @@ Existing migrations:
 | `V3__add_group_lifecycle.sql` | Adds `conversations.deleted_at` with its checks; marks groups without members deleted |
 | `V4__create_messages.sql` | Creates `messages` with its history index |
 | `V5__create_outbox_and_processed_events.sql` | Creates `outbox_events` with a partial index of pending events, `processed_events`, and the example consumer's `conversation_message_counts` |
+| `V6__add_message_sequence_numbers.sql` | Adds `messages.sequence_number`, numbers existing messages in history order, unique per conversation (its index includes the sender) |
+| `V7__create_receipt_positions.sql` | Creates `receipt_positions`: each member's delivered and read position, removed with the membership |
 
 To see which migrations have been applied to the local database:
 
