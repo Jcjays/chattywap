@@ -1,12 +1,18 @@
 package com.adonis.chattywap.realtime;
 
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.messaging.support.AbstractSubscribableChannel;
+import org.springframework.web.socket.WebSocketHandler;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.config.annotation.DelegatingWebSocketMessageBrokerConfiguration;
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
 import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+import org.springframework.web.socket.messaging.SubProtocolWebSocketHandler;
 
 import java.util.UUID;
 
@@ -26,9 +32,11 @@ import java.util.UUID;
  * Frames from one connection are processed one at a time, in the order they arrive, and messages to one connection
  * are sent in the order they were published. Otherwise the server processes frames in parallel, and two messages a
  * client sends right after each other could be stored, and delivered, in the opposite order.
+ * <p>
+ * A connection is closed only after the frames already sent to it went out ({@link BrokerConfig}), so that a client
+ * whose frame is rejected receives the ERROR frame before the connection closes.
  */
 @Configuration(proxyBeanMethods = false)
-@EnableWebSocketMessageBroker
 @EnableConfigurationProperties(RealtimeProperties.class)
 class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
@@ -101,6 +109,33 @@ class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 	/** The destination where members receive the conversation's messages. */
 	static String messagesTopic(UUID conversationId) {
 		return MESSAGES_TOPIC.replace("{conversationId}", conversationId.toString());
+	}
+
+	/**
+	 * What {@link EnableWebSocketMessageBroker} sets up, configured by {@link WebSocketConfig}, except that every
+	 * connection's session is a {@link FlushBeforeCloseSessionDecorator}.
+	 */
+	@Configuration(proxyBeanMethods = false)
+	static class BrokerConfig extends DelegatingWebSocketMessageBrokerConfiguration {
+
+		@Bean
+		@Override
+		public WebSocketHandler subProtocolWebSocketHandler(AbstractSubscribableChannel clientInboundChannel,
+				AbstractSubscribableChannel clientOutboundChannel) {
+			SubProtocolWebSocketHandler handler =
+					new SubProtocolWebSocketHandler(clientInboundChannel, clientOutboundChannel) {
+
+						@Override
+						protected WebSocketSession decorateSession(WebSocketSession session) {
+							return new FlushBeforeCloseSessionDecorator(session, getSendTimeLimit(),
+									getSendBufferSizeLimit());
+						}
+
+					};
+			handler.setPhase(getPhase());
+			return handler;
+		}
+
 	}
 
 }
