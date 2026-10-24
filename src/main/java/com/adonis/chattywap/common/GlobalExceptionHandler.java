@@ -13,9 +13,6 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
-import java.util.Comparator;
-import java.util.List;
-
 /**
  * Turns exceptions thrown while handling a request into RFC 9457 problem-detail responses
  * ({@code application/problem+json}), so every error has the same shape:
@@ -32,19 +29,14 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
 	/**
-	 * Bean Validation failures on a {@code @Valid @RequestBody}. Lists each invalid field with its message.
-	 * The rejected value is left out on purpose: it could be a password.
+	 * Bean Validation failures on a {@code @Valid @RequestBody}. Lists each invalid field with its message, without
+	 * the rejected value (see {@link FieldViolation}).
 	 */
 	@Override
 	protected ResponseEntity<Object> handleMethodArgumentNotValid(MethodArgumentNotValidException ex,
 			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
-		List<FieldViolation> violations = ex.getBindingResult().getFieldErrors().stream()
-				.map(error -> new FieldViolation(error.getField(), error.getDefaultMessage()))
-				.sorted(Comparator.comparing(FieldViolation::field).thenComparing(FieldViolation::message))
-				.toList();
-
 		ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, "Request validation failed.");
-		problem.setProperty("errors", violations);
+		problem.setProperty("errors", FieldViolation.of(ex.getBindingResult()));
 		return handleExceptionInternal(ex, problem, headers, status, request);
 	}
 
@@ -56,9 +48,6 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	ProblemDetail handleUnexpected(Exception ex) {
 		log.error("Unexpected error while handling a request", ex);
 		return ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
-	}
-
-	record FieldViolation(String field, String message) {
 	}
 
 }

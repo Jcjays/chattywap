@@ -31,6 +31,7 @@ The same file is read by Docker Compose (to create the containers) and by the ap
 | `JWT_ISSUER`, `JWT_AUDIENCE` | `iss` and `aud` claims written into and required from access tokens | `chattywap`, `chattywap-api` |
 | `JWT_ACCESS_TOKEN_TTL` | Access-token lifetime | `15m` |
 | `REFRESH_TOKEN_TTL` | Refresh-token lifetime | `30d` |
+| `WEBSOCKET_ALLOWED_ORIGINS` | Comma-separated origins of web pages that may open WebSocket connections, besides pages served by the application. Patterns such as `https://*.example.com` work. Clients that send no `Origin` header, such as Android apps, don't need it. | none |
 
 Generate `JWT_SECRET` and paste the output into `.env` (Git Bash, macOS and Linux all have `openssl`):
 
@@ -70,7 +71,7 @@ To stop the services:
 
 Or run `ChattywapApplication` from your IDE, with the working directory set to this project directory so that `.env` is found. The application listens on <http://localhost:8080>.
 
-Every endpoint requires an access token except registration, login, refresh, logout and health. See [Authentication](#authentication).
+Every endpoint requires an access token except registration, login, refresh, logout and health. See [Authentication](#authentication). The WebSocket endpoint `ws://localhost:8080/ws` takes the access token in its STOMP `CONNECT` frame instead; see [Real-time messaging](#real-time-messaging-websocket-and-stomp).
 
 ## Check health
 
@@ -419,7 +420,7 @@ Members of a conversation can post messages to it and read its history. Both end
 | `POST /api/v1/conversations/{conversationId}/messages` | `content` | `201` with the stored message |
 | `GET /api/v1/conversations/{conversationId}/messages?page=0&size=20` or `?size=20&cursor=...` | none | `200` with one page of the history, newest message first |
 
-Messages are stored and read through these endpoints only. Delivering them to connected clients as they arrive (WebSocket/STOMP), read receipts, unread counts, editing, deleting, reactions, attachments and search are not part of this API yet.
+Clients connected over WebSocket also receive new messages as they are sent, and can send them that way too; see [Real-time messaging](#real-time-messaging-websocket-and-stomp). These endpoints stay the way to read the history. Read receipts, unread counts, editing, deleting, reactions, attachments and search are not part of this API yet.
 
 ### Content
 
@@ -498,11 +499,11 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 
 ### Design decisions
 
-- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. There is no strict per-conversation sequence number: storing and paging history don't need one. Whether real-time delivery needs one (for example to detect gaps after a reconnect) is left to that milestone; see `ARCHITECTURE.md`, unresolved decision 9.
+- **Order by time, then ID.** `createdAt` is the server's clock, in microseconds, and the ID breaks ties, so the order is total and the same on every request. It is a timestamp, not a sequence number. Because sends to one conversation are serialized and read the clock after taking the conversation lock, a message that commits later gets a later time on one server: the history order is the commit order. With several application instances, clock differences between them can break that, and messages stored in the same microsecond are ordered by their random IDs. There is no strict per-conversation sequence number: storing and paging history don't need one, and real-time delivery doesn't add one either (see [Order and delivery](#order-and-delivery) and `ARCHITECTURE.md`, unresolved decision 9).
 - **Membership checked under the conversation lock.** Sending takes the conversation lock that every group change takes, after checking that the sender is a member, checks the membership again under the lock, stores the message and moves the conversation's `updatedAt` to the message's time, all in one transaction. Leaving, removal and group deletion wait for a message that is being sent, and a message sent while one of them is in progress waits for it and is then rejected. Taking the conversation lock first, like every group change, also means sends and group changes can't deadlock. Reading the history takes no lock: a read at the same moment as a removal sees the membership from before or after it.
 - **Conversation activity.** Sending a message moves the conversation's `updatedAt`, its activity time, to the message's `createdAt`, so the conversation moves to the top of its members' lists. The update is part of the message's transaction: if storing the message fails, `updatedAt` keeps its old value. `updatedAt` is reused rather than adding a separate field, so the conversation list's order, cursors and JSON stay as they were; `updatedAt` simply also counts messages as activity now. It has no index, so updating it on every message touches no index.
-- **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Storing a message is not delivering it: nothing is pushed to other members yet.
-- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes six statements (membership check, conversation lock, membership check under the lock, sender, insert, activity time) and a page at most four (membership, messages, count, senders), however many senders it has.
+- **Stored before reporting success.** The transaction commits before the `201` is sent. If it fails, the client gets a `500` and the message isn't stored. Only after the commit is the message delivered to connected members (see [Real-time messaging](#real-time-messaging-websocket-and-stomp)), so a message that couldn't be stored is never delivered.
+- **Senders without N+1 queries.** Messages refer to their conversation and sender by ID (no JPA association across features). A page loads all its senders in one query, reading only their ID and display name. Sending takes seven statements (membership check, conversation lock, membership check under the lock, the members who will receive the message, sender, insert, activity time) and a page at most four (membership, messages, count, senders), however many senders or members there are.
 - **Pagination in the database.** Pages use `FETCH FIRST`, and `OFFSET` for page numbers. A page by cursor selects the messages that sort after the cursor with a row comparison, `(created_at, id) < (t, i)`, which PostgreSQL uses as the start of the index scan. The equivalent `created_at < t or (created_at = t and id < i)` filters every newer message instead.
 - **Indexes.** One new index, `messages (conversation_id, created_at, id)`. PostgreSQL reads it backwards for the newest-first order, so pages need no sort. Checked against 1,000,000 messages, 200,000 of them in one conversation: the first page and a cursor page 100,000 messages deep each read a handful of index pages in under 0.1 ms. Membership checks use the existing membership indexes. There is no index on `sender_id`: nothing looks messages up by sender, and users can't be deleted, so it would only slow down inserts.
 - **Database constraints.** Foreign keys to the conversation and the sender (`on delete restrict`: a conversation or a user with messages can't be deleted; nothing in the application deletes either); `content` is `varchar(4000)` and can't be empty or only ASCII whitespace. The API's checks are stricter, so the database constraints only catch bugs.
@@ -512,9 +513,182 @@ Errors use the same problem-detail format as the rest of the API (see [Errors](#
 
 - Page numbers get slower the further back they go: a page reads and skips every newer message (about 18 ms at an offset of 100,000), and every page by number counts the conversation's messages for `totalElements` (about 40 ms with 200,000 messages). Pages by cursor don't count and take the same time at any depth.
 - Messages to one conversation are stored one after the other, under the conversation lock, and wait for group changes in progress. Each holds the lock until it commits (a few milliseconds), which limits how many messages one conversation can take per second; different conversations don't affect each other.
-- There is no real-time delivery. Clients see new messages by loading the first page of the history again.
 - With several application instances, the history order isn't guaranteed to be the order in which messages became visible (see [History order and pagination](#history-order-and-pagination)).
 - `updatedAt` now also moves when a message is sent. A client that used it to tell whether a conversation's members or name changed will see it move more often.
+
+## Real-time messaging (WebSocket and STOMP)
+
+Clients that keep a WebSocket connection open receive a conversation's new messages as they are sent, and can send messages over the same connection. The connection speaks [STOMP 1.2](https://stomp.github.io/stomp-specification-1.2.html), which most STOMP client libraries for Android support.
+
+The WebSocket only delivers messages sent while a client is connected. The history endpoint stays the record of what was sent: a client that was offline catches up from it (see [Missed messages](#missed-messages-and-reconnecting)).
+
+| What | How |
+|---|---|
+| Endpoint | `ws://localhost:8080/ws` (plain WebSocket, no SockJS) |
+| Authenticate | `Authorization: Bearer <accessToken>` header in the STOMP `CONNECT` frame |
+| Send a message | `SEND` to `/app/conversations/{conversationId}/messages`, body `{"content": "..."}` |
+| Receive a conversation's messages | `SUBSCRIBE` to `/topic/conversations/{conversationId}/messages` |
+| Receive the errors of your own messages | `SUBSCRIBE` to `/user/queue/errors` |
+
+In the frame examples below, `^@` stands for the NUL byte that ends every STOMP frame.
+
+### Connecting
+
+1. Open a WebSocket to `/ws`. The handshake needs no access token, and an `Authorization` header on it is ignored.
+2. Send `CONNECT` with the access token:
+
+   ```
+   CONNECT
+   accept-version:1.2
+   host:localhost
+   Authorization:Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+
+   ^@
+   ```
+
+3. The server answers `CONNECTED`, with the user ID from the token as `user-name`:
+
+   ```
+   CONNECTED
+   version:1.2
+   heart-beat:0,0
+   user-name:5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11
+
+   ^@
+   ```
+
+- The token is the same access token as for REST, checked the same way: signature, expiry, issuer and audience. The header name is case-sensitive, as all STOMP headers are; the `Bearer ` prefix isn't.
+- The connection's user is the token's user, for every later frame. User IDs or logins in headers (`login`, `user-name`, ...) or in message bodies are never used.
+- A missing, malformed, expired or wrongly signed token is answered with an `ERROR` frame (`401`), and the server closes the connection. So is every frame sent before `CONNECT`, with `400`.
+- **Token expiry**: every later `SUBSCRIBE` and `SEND` checks that the connection's token is still valid, like every REST request does. After it has expired, the next `SUBSCRIBE` or `SEND` is rejected with `401` and the connection is closed, and the frame has no effect. A connection that only receives isn't interrupted. Clients should refresh their token before it expires (`expiresIn` in the login and refresh responses) and reconnect with the new one; messages sent in between are in the history.
+- Web pages may only connect from the application's own origin or an origin in `WEBSOCKET_ALLOWED_ORIGINS`; others get `403` on the handshake. Clients that send no `Origin` header, such as Android apps, aren't affected.
+- The server sends no STOMP heartbeats. To notice a dead connection, use WebSocket pings (for example OkHttp's `pingInterval`), which the server answers.
+
+### Subscribing
+
+Subscribe to each conversation the client shows, with any subscription `id`:
+
+```
+SUBSCRIBE
+id:sub-0
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages
+
+^@
+```
+
+Every message stored in the conversation then arrives as a `MESSAGE` frame. Its body is the stored message, the same JSON as the REST response and the history entry, with the server's `id` and `createdAt`:
+
+```
+MESSAGE
+destination:/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages
+content-type:application/json
+subscription:sub-0
+message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-0
+content-length:256
+
+{"id":"0b9e7d1c-4f3a-4e2b-9c8d-7a6b5c4d3e2f","conversationId":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d","sender":{"id":"5f0c5e7e-3c1b-4d2a-9f43-2a7d0f1b9c11","displayName":"Alice"},"content":"Who is bringing snacks?","createdAt":"2026-10-24T10:30:00.123456Z"}^@
+```
+
+Messages sent through REST and through STOMP arrive the same way, once each. The sender receives its own messages too, if it is subscribed.
+
+- **Only members can subscribe**, decided in the database at the moment of subscribing. A conversation the user isn't a member of, an unknown ID and a deleted group all get the same `ERROR` frame (`404`, `Conversation not found.`), and the server closes the connection. STOMP has no way to reject one subscription and keep the connection. Clients should subscribe only to conversations from their current list; to tell which subscription failed, add a `receipt` header to each `SUBSCRIBE`, which the `ERROR` frame repeats as `receipt-id`.
+- **Losing membership ends delivery.** A member who leaves or is removed keeps the subscription, but receives none of the messages sent after that, and subscribing again is rejected. Nobody is told; the client sees the change in the conversation list.
+- **Only these destinations** can be subscribed to. Patterns (`/topic/conversations/*/messages`), other users' queues and conversation IDs not written exactly as the API returns them (lower case, with hyphens) are rejected with `404` (`Unknown destination.`), and the connection is closed.
+- New conversations aren't announced over the WebSocket. A client subscribes to a conversation after creating it, or after it appears in the conversation list.
+
+### Sending
+
+```
+SEND
+destination:/app/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages
+content-type:application/json
+
+{"content": "Who is bringing snacks?"}^@
+```
+
+- The body and its rules are those of `POST /api/v1/conversations/{conversationId}/messages`: see [Content](#content). The sender is always the connection's user, and only members can send.
+- There is no direct reply. Once the message is stored, it is delivered to the conversation's subscribers, the sender included: that `MESSAGE` frame is the confirmation, with the stored `id` and `createdAt`. The server doesn't send `RECEIPT` frames for `SEND`.
+- A message that isn't stored is answered on `/user/queue/errors`, to the sending connection only, as a problem detail with the same status and `detail` as the REST endpoint would give, and the destination as `instance`. The connection stays open. Nothing is stored or delivered.
+
+  ```
+  MESSAGE
+  destination:/user/queue/errors
+  content-type:application/json
+  subscription:errors
+  message-id:a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d-1
+  content-length:168
+
+  {"type":"about:blank","title":"Not Found","status":404,"detail":"Conversation not found.","instance":"/app/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages"}^@
+  ```
+
+- Only `/app/conversations/{conversationId}/messages` accepts `SEND`. Sending anywhere else, in particular straight to a `/topic/...` destination, which would reach subscribers without being stored, is rejected with an `ERROR` frame (`404`, `Unknown destination.`), and the connection is closed.
+
+### Errors
+
+Errors are problem details, like REST errors. Problems with a frame itself end the connection with an `ERROR` frame; problems with a message sent on a valid connection are answered on `/user/queue/errors`, and the connection stays open.
+
+| Situation | Answer | Status, `detail` |
+|---|---|---|
+| `CONNECT` without a valid access token; `SUBSCRIBE` or `SEND` after the token expired | `ERROR`, connection closed | `401`, `Missing, invalid or expired access token.` |
+| A frame before `CONNECT`, a second `CONNECT`, a malformed frame | `ERROR`, connection closed | `400`, `Invalid STOMP frame.` |
+| `ACK`, `NACK`, `BEGIN`, `COMMIT`, `ABORT` | `ERROR`, connection closed | `400`, `Unsupported STOMP frame.` |
+| `SUBSCRIBE` or `SEND` to any other destination | `ERROR`, connection closed | `404`, `Unknown destination.` |
+| `SUBSCRIBE` to a conversation the user isn't a member of, doesn't exist or was deleted | `ERROR`, connection closed | `404`, `Conversation not found.` |
+| `SEND` with blank, too long or otherwise invalid `content` | `/user/queue/errors` | `400`, `Request validation failed.`, with `errors` as in REST |
+| `SEND` with an empty body, malformed JSON or JSON that isn't an object | `/user/queue/errors` | `400`, `Failed to read message payload.` |
+| `SEND` to a conversation the user isn't (or is no longer) a member of, doesn't exist or was deleted | `/user/queue/errors` | `404`, `Conversation not found.` |
+| The message couldn't be stored, or another unexpected server error | `/user/queue/errors` (`ERROR` and closed, if it happened while checking a frame) | `500`, `An unexpected error occurred.` Details go to the server log only. |
+
+An `ERROR` frame carries the `detail` as its `message` header and the problem detail as its body. Rejected values, exception messages and other internals are never included.
+
+```
+ERROR
+message:Conversation not found.
+content-type:application/problem+json
+content-length:170
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"Conversation not found.","instance":"/topic/conversations/7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d/messages"}^@
+```
+
+### Missed messages and reconnecting
+
+The server keeps nothing for clients that aren't connected. Messages sent while a client was offline are only in the history, which can be read whether or not the client has a WebSocket connection. After reconnecting:
+
+1. Connect with a valid access token and subscribe to the conversations again, **before** reading the history. Messages stored from then on are delivered live.
+2. For each conversation, load the first page of the history (`GET /api/v1/conversations/{conversationId}/messages?size=50`) and take the messages newer than the last one the client has: stop at that message's `id`. If the page ends before it, follow `nextCursor`.
+3. Merge them with the messages that arrived live meanwhile, dropping duplicates by `id`: a message stored between steps 1 and 2 arrives both ways.
+
+The conversation list (`GET /api/v1/conversations`) shows which conversations had activity: they are ordered by `updatedAt`, which moves with every message.
+
+Stopping at a known `id` relies on history order matching the order in which messages became visible. That holds on one application instance; see [History order and pagination](#history-order-and-pagination) for when it doesn't.
+
+### Order and delivery
+
+- **Stored, then delivered.** A message is delivered only after the transaction that stores it has committed. A message that couldn't be stored is never delivered, and the `MESSAGE` frame always carries the stored `id` and `createdAt`.
+- **Once, at most.** Each stored message is delivered at most once to each subscribed connection, whether it was sent through REST or STOMP. Delivery isn't retried: a connection that drops at that moment misses it, and catches up from the history.
+- **One connection's messages keep their order.** Frames from one connection are processed one after the other, so messages a client sends in a row are stored, and delivered, in the order it sent them.
+- **Across senders, use the history order.** Messages of one conversation are stored one after the other, and on one instance the history order (`createdAt`, then `id`) is the order in which they were stored. Delivery happens right after each commit, so messages from different senders sent at the same moment can arrive in a different order than the history shows. Clients place each message by `createdAt` and `id`, not by arrival. `createdAt` is a timestamp, not a sequence number, so the caveats in [History order and pagination](#history-order-and-pagination) apply.
+- **No duplicate protection.** A client that sends again because it didn't see its message (for example after the connection dropped) can store it twice. Check the history first.
+- **One application instance.** The STOMP broker is Spring's in-memory broker inside the application. A client only receives messages that were sent through the instance it is connected to. Running several instances needs a shared broker, which is a later milestone.
+
+### Design decisions
+
+- **Authentication in the CONNECT frame, not the handshake.** STOMP clients can set `CONNECT` headers everywhere, also where they can't set HTTP headers on the WebSocket handshake (browsers). The handshake (`GET /ws`) is therefore public; every other HTTP rule is unchanged, so all other paths, including other methods on `/ws`, still need an access token. A connection can do nothing before its `CONNECT` is accepted, and Spring closes connections that send no frame within a minute. The token is validated by Spring Security's JWT authentication provider with the application's `JwtDecoder`, the same as for REST, and removed from the `CONNECT` frame afterwards so it isn't passed on.
+- **Deny by default.** An interceptor (`realtime.StompSecurityInterceptor`) checks every frame before any handler or the broker sees it: which commands, which destinations, whose token. The decisions themselves stay with the services: `ConversationService.requireMembership` decides subscriptions, and `MessageService` decides sends, exactly as for REST.
+- **Recipients are fixed when the message is stored.** Sending reads the conversation's members under the conversation lock that every send and membership change takes, and publishes them with the message. Delivery goes only to their connections: a subscription that outlived its user's membership receives nothing. A member removed after the message was stored still receives it, as they could still read it in the history at that moment. Reading the members adds one statement to every send (seven in all).
+- **Delivered after the commit, from one place.** `MessageService` publishes a `MessageSentEvent` for every stored message. `realtime.MessageBroadcaster` delivers it once the transaction has committed (`@TransactionalEventListener`), so REST and STOMP sends share one path and nothing is delivered twice or before it exists. If delivery fails, the message stays stored and the send still succeeds; the failure is logged. There is no transactional outbox yet: a message whose delivery is lost (for example because the application stops right after the commit) is only in the history.
+- **Order kept per connection.** Frames from one connection are processed in order, and messages to one connection are sent in the order they were published (Spring's `preserveReceiveOrder` and `preservePublishOrder`). Without that, Spring processes a connection's frames in parallel, and two messages sent in a row could be stored in the opposite order. The cost: one connection's frames wait for each other. Because Spring's ordering only logs exceptions thrown while checking a frame, the interceptor sends its `ERROR` frames itself.
+- **Errors as problem details.** `ERROR` frames and error-queue messages use the same format, statuses and messages as REST errors, so clients handle both alike.
+
+### Known limitations
+
+- One application instance only (see [Order and delivery](#order-and-delivery)).
+- An expired token is noticed at the connection's next `SUBSCRIBE` or `SEND`, not when it expires: a connection that only receives keeps receiving, also after its user logged out, until it disconnects.
+- No confirmation per sent message other than its delivery, no `RECEIPT` for `SEND`, and no idempotency key against duplicates.
+- A rejected subscription closes the whole connection.
+- New conversations, membership changes and deleted groups aren't announced over the WebSocket.
+- Delivery order across senders can differ from the history order (see [Order and delivery](#order-and-delivery)).
+- No STOMP heartbeats from the server.
 
 ## Run tests
 
@@ -551,7 +725,11 @@ To run only the authentication tests:
 | `ConversationControllerIT` | Every conversation endpoint through HTTP: creation and duplicate direct conversations, validation, listing, pagination by number and by cursor (equal timestamps, every conversation exactly once across pages of several sizes, changes between pages, invalid cursors), access control (`401`, `403`, `404` for non-members), adding and removing members, the member limit, promoting and demoting (last administrator, invalid changes), renaming, deleting, leaving, the administrator hand-over and the deletion of groups whose last member leaves |
 | `ConversationServiceIT` | Concurrent creation of the same direct conversation; under the conversation lock: concurrent adds of the same user, concurrent adds near the member limit, concurrent leaves, administrators demoting themselves at once, deletion during an addition, the last two members leaving at once; rollback when a membership insert fails or a deletion can't be completed; agreement with PostgreSQL's UUID order |
 | `MessageControllerIT` | Both message endpoints through HTTP: sending (the caller is always the sender, content stored as sent, blank, too long, NUL and unpaired-surrogate content, malformed bodies, a failed commit is a `500` without details that changes nothing), access control (`401`, `404` for non-members, former members and deleted groups, identical to unknown IDs), sending moves the conversation to the top of the list while rejected messages don't, the history's order (equal timestamps), pagination by number and by cursor (every message exactly once across pages of several sizes, new messages between pages, size limit, invalid cursors), no messages from other conversations |
-| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times in commit order, while other conversations aren't held up; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders it has |
+| `MessageServiceIT` | Sending at the same moment as the sender leaves, is removed or the group is deleted (the message is stored before or not at all); messages to one conversation stored one after the other, with times in commit order, while other conversations aren't held up; concurrent messages and group changes without deadlocks; the activity time needs the caller's transaction; the number of statements per send and per page, however many senders or members it has |
+| `StompSecurityIT` | Over a real WebSocket connection: `CONNECT` with a valid token (the connection's user), with malformed, wrongly signed, expired, wrong-issuer and wrong-audience tokens, and without a bearer token; a token on the handshake is ignored; frames before `CONNECT` and unsupported frames; other origins can't connect; the rest of HTTP still needs a token; members can subscribe, non-members, former members and deleted groups get the same `404` as unknown IDs; patterns, other users' queues and other destinations are rejected; removed members stop receiving; non-members can't send; sending to broker destinations is rejected; the sender is always the connection's user; no `SUBSCRIBE` or `SEND` after the token expired |
+| `StompMessagingIT` | Over real WebSocket connections: a message is stored before it is delivered, to every subscriber including the sender, with the stored ID and time and the same JSON as the history; a message whose commit fails is reported to the sender only and never delivered; messages reach only their own conversation's topic; each message is delivered once, sent through REST or STOMP; invalid and unreadable messages are answered on the error queue and the connection stays open; one connection's messages are stored and delivered in the order sent; concurrent senders: every message stored once, delivered once, each sender's order kept; messages missed while disconnected are in the history |
+
+The STOMP tests run against a server on a random port (`webEnvironment = RANDOM_PORT`), so they start their own application context and containers.
 
 To run only the conversation tests:
 
@@ -563,6 +741,12 @@ To run only the message tests:
 
 ```bash
 ./mvnw verify -Dtest='KeysetCursorTest' -Dit.test='MessageControllerIT,MessageServiceIT,DatabaseSchemaIT'
+```
+
+To run only the real-time (WebSocket/STOMP) tests:
+
+```bash
+./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='StompSecurityIT,StompMessagingIT'
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push to `main` and on every pull request.

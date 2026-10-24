@@ -314,6 +314,20 @@ public class ConversationService {
 	}
 
 	/**
+	 * The user IDs of the conversation's members, the caller included. For other features that act for all members,
+	 * such as delivering a new message to them. Called after {@link #recordActivity} in the same transaction, it reads
+	 * the members under the conversation lock: the members at the time of the activity.
+	 *
+	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
+	 */
+	@Transactional(readOnly = true)
+	public Set<UUID> getMemberIds(UUID callerId, UUID conversationId) {
+		List<ConversationMember> members = memberRepository.findByConversationId(conversationId);
+		requireMember(members, callerId);
+		return members.stream().map(ConversationMember::getUserId).collect(Collectors.toUnmodifiableSet());
+	}
+
+	/**
 	 * Adds users to a group as {@link MemberRole#MEMBER}s. Users who are already members are skipped, so
 	 * repeating a request changes nothing. Either all new users are added or, if they would take the group past
 	 * the member limit, none.

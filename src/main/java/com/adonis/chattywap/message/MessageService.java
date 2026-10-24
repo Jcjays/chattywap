@@ -7,8 +7,10 @@ import com.adonis.chattywap.conversation.ConversationNotFoundException;
 import com.adonis.chattywap.conversation.ConversationService;
 import com.adonis.chattywap.message.dto.MessagePageResponse;
 import com.adonis.chattywap.message.dto.MessageResponse;
+import com.adonis.chattywap.message.dto.MessageSentEvent;
 import com.adonis.chattywap.user.UserService;
 import com.adonis.chattywap.user.dto.UserSummary;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -40,6 +42,10 @@ import java.util.stream.Collectors;
  * several application instances whose clocks differ, or a clock that is set back, it isn't guaranteed: a message
  * that commits later can sort below one that was already visible. Messages stored in the same microsecond are
  * ordered by their random IDs.
+ * <p>
+ * Every stored message is announced with a {@link MessageSentEvent}, which the {@code realtime} feature delivers to
+ * connected members once the transaction has committed. Both ways of sending, REST and STOMP, go through
+ * {@link #sendMessage}, so each message is announced exactly once.
  */
 @Service
 public class MessageService {
@@ -50,11 +56,14 @@ public class MessageService {
 
 	private final UserService userService;
 
+	private final ApplicationEventPublisher eventPublisher;
+
 	public MessageService(MessageRepository messageRepository, ConversationService conversationService,
-			UserService userService) {
+			UserService userService, ApplicationEventPublisher eventPublisher) {
 		this.messageRepository = messageRepository;
 		this.conversationService = conversationService;
 		this.userService = userService;
+		this.eventPublisher = eventPublisher;
 	}
 
 	/**
@@ -65,6 +74,9 @@ public class MessageService {
 	 * The conversation stays locked from the membership check to the commit, so a message is never stored after
 	 * its sender left or was removed, or after the group was deleted. Messages to the same conversation are stored
 	 * one after the other.
+	 * <p>
+	 * Publishes a {@link MessageSentEvent} with the members at that moment as recipients. Listeners deliver it only
+	 * if the transaction commits, so a message that couldn't be stored is never delivered.
 	 *
 	 * @param content valid as message content (see {@code SendMessageRequest}); stored as it is
 	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
@@ -72,8 +84,12 @@ public class MessageService {
 	@Transactional
 	public MessageResponse sendMessage(UUID callerId, UUID conversationId, String content) {
 		Instant createdAt = conversationService.recordActivity(callerId, conversationId);
+		// Read under the conversation lock that recordActivity took: nobody can join or leave until the commit.
+		Set<UUID> recipientIds = conversationService.getMemberIds(callerId, conversationId);
 		Message message = messageRepository.save(new Message(conversationId, callerId, content, createdAt));
-		return toResponses(List.of(message)).getFirst();
+		MessageResponse response = toResponses(List.of(message)).getFirst();
+		eventPublisher.publishEvent(new MessageSentEvent(response, recipientIds));
+		return response;
 	}
 
 	/**
