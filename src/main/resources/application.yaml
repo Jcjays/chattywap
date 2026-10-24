@@ -35,6 +35,11 @@ chattywap:
     # Durations accept units such as 30s, 15m, 12h, 30d.
     access-token-ttl: ${JWT_ACCESS_TOKEN_TTL:15m}
     refresh-token-ttl: ${REFRESH_TOKEN_TTL:30d}
+  realtime:
+    # Comma-separated origins of web pages that may open WebSocket connections (patterns such as
+    # https://*.example.com allowed), besides pages served by this application. Empty by default.
+    # Clients that send no Origin header, such as mobile apps, aren't affected.
+    allowed-origins: ${WEBSOCKET_ALLOWED_ORIGINS:}
 
 management:
   endpoints:

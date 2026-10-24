@@ -13,6 +13,7 @@ import org.springframework.security.oauth2.server.resource.web.DefaultBearerToke
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
+import org.springframework.security.web.util.matcher.OrRequestMatcher;
 import org.springframework.security.web.util.matcher.RequestMatcher;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -25,6 +26,12 @@ import tools.jackson.databind.json.JsonMapper;
  */
 @Configuration(proxyBeanMethods = false)
 class SecurityConfig {
+
+	/**
+	 * The path of the STOMP endpoint, as {@code realtime} registers it. Repeated here, because {@code auth} doesn't
+	 * depend on {@code realtime}.
+	 */
+	private static final String WEBSOCKET_ENDPOINT = "/ws";
 
 	@Bean
 	SecurityFilterChain securityFilterChain(HttpSecurity http, JsonMapper jsonMapper) throws Exception {
@@ -39,6 +46,10 @@ class SecurityConfig {
 								"/api/v1/auth/refresh",
 								"/api/v1/auth/logout").permitAll()
 						.requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
+						// The WebSocket handshake of the STOMP endpoint (realtime.WebSocketConfig). STOMP clients
+						// authenticate in their CONNECT frame instead, with the same access token, and the server
+						// accepts no other frame from a connection before that (realtime.StompSecurityInterceptor).
+						.requestMatchers(HttpMethod.GET, WEBSOCKET_ENDPOINT).permitAll()
 						// Spring Boot forwards failed requests to /error to render them. Keeping it public
 						// stops a server error from being reported as 401.
 						.requestMatchers("/error").permitAll()
@@ -66,17 +77,21 @@ class SecurityConfig {
 	}
 
 	/**
-	 * Reads the access token from the {@code Authorization} header, except on the authentication endpoints.
+	 * Reads the access token from the {@code Authorization} header, except on the authentication endpoints and the
+	 * WebSocket handshake.
 	 * <p>
 	 * {@code permitAll()} doesn't stop the bearer-token filter: if a request carries a token, the filter
 	 * validates it and rejects the request when it's invalid. Clients often attach their access token to every
 	 * request, and a refresh request is exactly when that token has expired. Ignoring the header on these
-	 * endpoints lets such a client still refresh, log out or log in.
+	 * endpoints lets such a client still refresh, log out or log in. On the handshake, the token in the STOMP
+	 * CONNECT frame is the only one that counts, so a token in the HTTP header neither helps nor hurts.
 	 */
 	private static BearerTokenResolver bearerTokenResolver() {
 		BearerTokenResolver headerResolver = new DefaultBearerTokenResolver();
-		RequestMatcher authEndpoints = PathPatternRequestMatcher.pathPattern("/api/v1/auth/**");
-		return request -> authEndpoints.matches(request) ? null : headerResolver.resolve(request);
+		RequestMatcher ignored = new OrRequestMatcher(
+				PathPatternRequestMatcher.pathPattern("/api/v1/auth/**"),
+				PathPatternRequestMatcher.pathPattern(WEBSOCKET_ENDPOINT));
+		return request -> ignored.matches(request) ? null : headerResolver.resolve(request);
 	}
 
 	/**
