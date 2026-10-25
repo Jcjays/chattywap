@@ -51,11 +51,14 @@ class OutboxEvent {
 	@Column(name = "last_error", updatable = false)
 	private String lastError;
 
+	@Column(name = "correlation_id", updatable = false)
+	private String correlationId;
+
 	protected OutboxEvent() {
 	}
 
 	private OutboxEvent(UUID id, String eventType, int eventVersion, String routingKey, String payload,
-			Instant createdAt) {
+			Instant createdAt, String correlationId) {
 		this.id = id;
 		this.eventType = eventType;
 		this.eventVersion = eventVersion;
@@ -63,12 +66,17 @@ class OutboxEvent {
 		this.payload = payload;
 		this.createdAt = createdAt;
 		this.nextAttemptAt = createdAt;
+		this.correlationId = correlationId;
 	}
 
-	/** An event that the relay may publish right away. */
+	/**
+	 * An event that the relay may publish right away.
+	 *
+	 * @param correlationId the request ID of the request that wrote it, or {@code null}
+	 */
 	static OutboxEvent pending(UUID eventId, String eventType, int eventVersion, String routingKey, String payload,
-			Instant createdAt) {
-		return new OutboxEvent(eventId, eventType, eventVersion, routingKey, payload, createdAt);
+			Instant createdAt, String correlationId) {
+		return new OutboxEvent(eventId, eventType, eventVersion, routingKey, payload, createdAt, correlationId);
 	}
 
 	UUID getId() {
@@ -94,6 +102,11 @@ class OutboxEvent {
 	/** Attempts so far, the current one included once the relay has claimed the event. */
 	int getAttempts() {
 		return attempts;
+	}
+
+	/** The request ID of the request that wrote the event, or {@code null}. */
+	String getCorrelationId() {
+		return correlationId;
 	}
 
 }

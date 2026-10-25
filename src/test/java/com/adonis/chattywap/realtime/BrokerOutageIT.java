@@ -5,10 +5,12 @@ import com.adonis.chattywap.conversation.ConversationService;
 import com.adonis.chattywap.message.dto.SendMessageRequest;
 import com.adonis.chattywap.user.UserService;
 import com.adonis.chattywap.user.dto.UserResponse;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalManagementPort;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
@@ -24,6 +26,7 @@ import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
+import org.springframework.web.client.RestClient;
 import org.testcontainers.containers.Container.ExecResult;
 import org.testcontainers.rabbitmq.RabbitMQContainer;
 import tools.jackson.databind.json.JsonMapper;
@@ -59,6 +62,12 @@ class BrokerOutageIT {
 
 	@LocalServerPort
 	private int port;
+
+	@LocalManagementPort
+	private int managementPort;
+
+	@Autowired
+	private MeterRegistry meterRegistry;
 
 	@Autowired
 	private MockMvcTester mvc;
@@ -133,9 +142,13 @@ class BrokerOutageIT {
 				assertThat(isPublished(overRest)).isFalse();
 				assertThat(isPublished(overStomp)).isFalse();
 
-				// The broker shows as down, but the instance stays ready to take requests.
-				assertThat(mvc.get().uri("/actuator/health/rabbit")).hasStatus(HttpStatus.SERVICE_UNAVAILABLE);
-				assertThat(mvc.get().uri("/actuator/health/readiness")).hasStatusOk();
+				// The broker shows as down to operators, but the instance stays alive and ready to take requests.
+				assertThat(httpStatus(managementPort, "/actuator/health/rabbit")).isEqualTo(503);
+				assertThat(httpStatus(managementPort, "/actuator/health")).isEqualTo(503);
+				assertThat(httpStatus(port, "/livez")).isEqualTo(200);
+				assertThat(httpStatus(port, "/readyz")).isEqualTo(200);
+				// So does the outbox backlog.
+				assertThat(meterRegistry.get("chattywap.outbox.pending").gauge().value()).isGreaterThanOrEqualTo(2);
 			}
 			finally {
 				rabbitmqctl("start_app");
@@ -158,6 +171,12 @@ class BrokerOutageIT {
 	// Helpers
 
 	private record TestUser(UUID id, String accessToken) {
+	}
+
+	/** The status of a GET over real HTTP: the probes and the management port aren't reachable through MockMvc. */
+	private static int httpStatus(int port, String path) {
+		return RestClient.create().get().uri("http://localhost:" + port + path)
+				.exchange((request, response) -> response.getStatusCode().value());
 	}
 
 	private void rabbitmqctl(String command) throws Exception {

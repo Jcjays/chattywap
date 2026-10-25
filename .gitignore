@@ -34,3 +34,7 @@ build/
 
 ### Local environment ###
 .env
+
+### Load tests ###
+# k6 summaries and metric samples of local runs (loadtest/README.md).
+loadtest/results/

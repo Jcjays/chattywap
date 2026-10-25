@@ -1,11 +1,15 @@
 package com.adonis.chattywap.realtime;
 
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
 import org.springframework.messaging.support.AbstractSubscribableChannel;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.config.annotation.DelegatingWebSocketMessageBrokerConfiguration;
@@ -27,12 +31,17 @@ import java.util.UUID;
  * {@value #RECEIPTS_TOPIC} ({@link MessageBroadcaster}), and the errors of the connection's own messages on
  * {@code /user/queue/errors}.</li>
  * </ul>
- * The broker is Spring's simple in-memory broker. It delivers only to clients connected to this application instance
- * (see ARCHITECTURE.md, unresolved decision 1).
+ * The broker is Spring's simple in-memory broker. It delivers only to clients connected to this application instance;
+ * {@code messaging} brings it the messages and receipt changes stored on other instances, which
+ * {@link MessageBroadcaster} delivers like this instance's own (ARCHITECTURE.md, decision 26).
  * <p>
- * Frames from one connection are processed one at a time, in the order they arrive, and messages to one connection
- * are sent in the order they were published. Otherwise the server processes frames in parallel, and two messages a
- * client sends right after each other could be stored, and delivered, in the opposite order.
+ * Frames from one connection are processed one at a time, in the order they arrive, on the thread that read them
+ * ({@link #configureClientInboundChannel}), and messages to one connection are sent in the order they were published.
+ * Otherwise the server processes frames in parallel, and two messages a client sends right after each other could be
+ * stored, and delivered, in the opposite order.
+ * <p>
+ * The broker offers heartbeats ({@link RealtimeProperties#heartbeat()}), so that connections whose client is gone are
+ * closed.
  * <p>
  * A connection is closed only after the frames already sent to it went out ({@link BrokerConfig}), so that a client
  * whose frame is rejected receives the ERROR frame before the connection closes.
@@ -67,18 +76,30 @@ class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
 	private final RealtimeProperties properties;
 
+	private final StompLogContextInterceptor logContextInterceptor;
+
 	private final StompSecurityInterceptor securityInterceptor;
 
 	private final RecipientSessionsInterceptor recipientSessionsInterceptor;
 
 	private final ProblemDetailStompErrorHandler errorHandler;
 
-	WebSocketConfig(RealtimeProperties properties, StompSecurityInterceptor securityInterceptor,
-			RecipientSessionsInterceptor recipientSessionsInterceptor, ProblemDetailStompErrorHandler errorHandler) {
+	private final TaskScheduler heartbeatScheduler;
+
+	/**
+	 * @param heartbeatScheduler the broker's own scheduler, which the broker configuration creates after this class, so
+	 *                           it is looked up when the broker starts
+	 */
+	WebSocketConfig(RealtimeProperties properties, StompLogContextInterceptor logContextInterceptor,
+			StompSecurityInterceptor securityInterceptor, RecipientSessionsInterceptor recipientSessionsInterceptor,
+			ProblemDetailStompErrorHandler errorHandler,
+			@Lazy @Qualifier("messageBrokerTaskScheduler") TaskScheduler heartbeatScheduler) {
 		this.properties = properties;
+		this.logContextInterceptor = logContextInterceptor;
 		this.securityInterceptor = securityInterceptor;
 		this.recipientSessionsInterceptor = recipientSessionsInterceptor;
 		this.errorHandler = errorHandler;
+		this.heartbeatScheduler = heartbeatScheduler;
 	}
 
 	@Override
@@ -95,14 +116,28 @@ class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 	public void configureMessageBroker(MessageBrokerRegistry registry) {
 		registry.setApplicationDestinationPrefixes(APPLICATION_PREFIX);
 		// "/queue" carries the user destinations ("/user/queue/errors" becomes "/queue/errors-user<session>").
-		registry.enableSimpleBroker("/topic", "/queue");
+		// Heartbeats only for connections that ask for them; see RealtimeProperties#heartbeat.
+		long heartbeat = properties.heartbeat().toMillis();
+		registry.enableSimpleBroker("/topic", "/queue")
+				.setHeartbeatValue(new long[] {heartbeat, heartbeat})
+				.setTaskScheduler(heartbeatScheduler);
 		registry.setUserDestinationPrefix(USER_PREFIX);
 		registry.setPreservePublishOrder(true);
 	}
 
+	/**
+	 * Frames are handled in the thread that read them from the connection, one at a time, instead of being queued for
+	 * a separate thread pool. The server then reads a connection's next frame only once the previous one is handled,
+	 * so a client that sends faster than its frames can be handled is slowed down by TCP, like a client sending REST
+	 * requests, instead of filling the server's memory: Spring's per-connection queue for ordered frames has no limit.
+	 * Measured before: 20,000 SEND frames of 4,000 characters were read in a second and then waited in memory for
+	 * minutes (loadtest/README.md). A connection's frames stay in order. The cost: a frame being handled occupies one
+	 * of the server's request threads, as a REST request does.
+	 */
 	@Override
 	public void configureClientInboundChannel(ChannelRegistration registration) {
-		registration.interceptors(securityInterceptor);
+		registration.interceptors(logContextInterceptor, securityInterceptor);
+		registration.executor(new SyncTaskExecutor());
 	}
 
 	@Override

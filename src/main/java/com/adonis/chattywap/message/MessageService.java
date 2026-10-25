@@ -13,10 +13,12 @@ import com.adonis.chattywap.user.dto.UserSummary;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.support.PageableExecutionUtils;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.List;
@@ -63,12 +65,20 @@ public class MessageService {
 
 	private final ApplicationEventPublisher eventPublisher;
 
+	private final ConversationSendGate sendGate;
+
+	/** Joins a running transaction or starts one, like {@code @Transactional}. */
+	private final TransactionTemplate transaction;
+
 	public MessageService(MessageRepository messageRepository, ConversationService conversationService,
-			UserService userService, ApplicationEventPublisher eventPublisher) {
+			UserService userService, ApplicationEventPublisher eventPublisher, ConversationSendGate sendGate,
+			PlatformTransactionManager transactionManager) {
 		this.messageRepository = messageRepository;
 		this.conversationService = conversationService;
 		this.userService = userService;
 		this.eventPublisher = eventPublisher;
+		this.sendGate = sendGate;
+		this.transaction = new TransactionTemplate(transactionManager);
 	}
 
 	/**
@@ -78,16 +88,24 @@ public class MessageService {
 	 * <p>
 	 * The conversation stays locked from the membership check to the commit, so a message is never stored after
 	 * its sender left or was removed, or after the group was deleted. Messages to the same conversation are stored
-	 * one after the other, each with the next sequence number.
+	 * one after the other, each with the next sequence number. On this instance, they also wait for each other before
+	 * they take a database connection ({@link ConversationSendGate}); non-members are turned away before that, so they
+	 * can't hold up a conversation they don't belong to.
 	 * <p>
 	 * Publishes a {@link MessageSentEvent} with the members at that moment as recipients. Listeners deliver it only
 	 * if the transaction commits, so a message that couldn't be stored is never delivered.
 	 *
 	 * @param content valid as message content (see {@code SendMessageRequest}); stored as it is
 	 * @throws ConversationNotFoundException if the conversation doesn't exist or the caller isn't a member
+	 * @throws ConversationBusyException if the sends to the conversation in front of this one take too long
 	 */
-	@Transactional
 	public MessageResponse sendMessage(UUID callerId, UUID conversationId, String content) {
+		conversationService.requireMembership(callerId, conversationId);
+		return sendGate.run(conversationId,
+				() -> transaction.execute(status -> store(callerId, conversationId, content)));
+	}
+
+	private MessageResponse store(UUID callerId, UUID conversationId, String content) {
 		Instant createdAt = conversationService.recordActivity(callerId, conversationId);
 		// Read under the conversation lock that recordActivity took: nobody can join or leave until the commit.
 		Set<UUID> recipientIds = conversationService.getMemberIds(callerId, conversationId);
@@ -115,9 +133,14 @@ public class MessageService {
 		PageRequest pageRequest = PageRequest.of(page, size);
 		// Spring Data JPA refuses offsets beyond Integer.MAX_VALUE. Such a page lies far past the end of any
 		// history, so it gets the same answer as every page past the end: no messages.
-		Page<Message> messages = pageRequest.getOffset() > Integer.MAX_VALUE
-				? new PageImpl<>(List.of(), pageRequest, messageRepository.countByConversation(conversationId))
+		List<Message> content = pageRequest.getOffset() > Integer.MAX_VALUE
+				? List.of()
 				: messageRepository.findPageByConversation(conversationId, pageRequest);
+		// The total is the highest sequence number, which equals the number of messages: one index entry, where
+		// counting would read every message of the conversation (MessageRepository#findLastSequenceNumber). Like a
+		// count, it is skipped when the page itself shows where the history ends.
+		Page<Message> messages = PageableExecutionUtils.getPage(content, pageRequest,
+				() -> messageRepository.findLastSequenceNumber(conversationId));
 
 		String nextCursor = messages.hasNext() && messages.hasContent()
 				? cursorAfter(messages.getContent().getLast())

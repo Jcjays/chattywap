@@ -55,6 +55,7 @@ class MessageCountConsumer {
 	void onMessageCreated(Message message) {
 		// The relay sets the event ID as the message ID, so even an unreadable body can be traced.
 		String messageId = message.getMessageProperties().getMessageId();
+		EventLogContext.set(message);
 		try {
 			MessageCreatedEvent event = read(message);
 			if (messageCountService.recordMessageCreated(event)) {
@@ -70,6 +71,9 @@ class MessageCountConsumer {
 			failures.increment();
 			log.warn("Processing message {} failed: {}", messageId, ex.toString());
 			throw ex;
+		}
+		finally {
+			EventLogContext.clear();
 		}
 	}
 

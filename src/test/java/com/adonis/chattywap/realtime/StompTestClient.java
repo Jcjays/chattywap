@@ -216,6 +216,11 @@ final class StompTestClient implements AutoCloseable {
 		}
 	}
 
+	/** Whether the connection is still open: the server hasn't closed it. */
+	boolean isOpen() {
+		return !closed.isDone();
+	}
+
 	/** Frames received so far and not yet taken with {@link #next()}. */
 	List<Frame> pending() {
 		List<Frame> pending = new ArrayList<>();

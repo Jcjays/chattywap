@@ -24,7 +24,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -139,13 +141,26 @@ class OutboxRelay {
 	}
 
 	/**
+	 * Publishes the batch, and logs its failed attempts once, summed up by reason (see {@link FailedAttempts}).
+	 */
+	private int publish(List<OutboxEvent> batch) {
+		FailedAttempts failures = new FailedAttempts();
+		try {
+			return publish(batch, failures);
+		}
+		finally {
+			failures.log();
+		}
+	}
+
+	/**
 	 * Sends the batch, then waits for its confirmations. Both together end before the claim's lease does, so that no
 	 * other relay claims these events while this one still works on them: sending stops once only the confirm timeout
 	 * is left of the lease, and at the first failed send. A send fails because of the connection or the channel
 	 * (broker unreachable, not answering, channel closed), and every later send would wait and fail the same way.
 	 * Events not sent are failed attempts, retried after their delay.
 	 */
-	private int publish(List<OutboxEvent> batch) {
+	private int publish(List<OutboxEvent> batch, FailedAttempts failures) {
 		long sendDeadline = System.nanoTime() + properties.lease().minus(properties.confirmTimeout()).toNanos();
 		List<InFlight> inFlight = new ArrayList<>();
 		String skipReason = null;
@@ -159,7 +174,7 @@ class OutboxRelay {
 				skipError = "Not sent: no time left before the claim's lease ends";
 			}
 			if (skipReason != null) {
-				recordFailure(event, skipReason, skipError);
+				recordFailure(event, skipReason, skipError, failures);
 				continue;
 			}
 			CorrelationData correlation = new CorrelationData();
@@ -170,12 +185,12 @@ class OutboxRelay {
 			}
 			catch (AmqpException ex) {
 				skipReason = (ex instanceof AmqpConnectException) ? "unreachable" : "send-error";
-				recordFailure(event, skipReason, "Send failed: " + ex);
+				recordFailure(event, skipReason, "Send failed: " + ex, failures);
 				skipError = "Not sent after an earlier send of the batch failed: " + ex;
 			}
 		}
 
-		List<UUID> confirmed = awaitConfirms(inFlight);
+		List<UUID> confirmed = awaitConfirms(inFlight, failures);
 		if (!confirmed.isEmpty()) {
 			// If this fails, the events stay pending and are published again after their lease: a duplicate, not a
 			// loss.
@@ -190,7 +205,7 @@ class OutboxRelay {
 	 * Waits for the broker's answer to every event sent, all within one confirm timeout. Returns the events it
 	 * acknowledged without returning them; records every other outcome as a failure.
 	 */
-	private List<UUID> awaitConfirms(List<InFlight> inFlight) {
+	private List<UUID> awaitConfirms(List<InFlight> inFlight, FailedAttempts failures) {
 		long deadline = System.nanoTime() + properties.confirmTimeout().toNanos();
 		List<UUID> confirmed = new ArrayList<>();
 		for (InFlight sent : inFlight) {
@@ -202,21 +217,21 @@ class OutboxRelay {
 				ReturnedMessage returned = sent.correlation().getReturned();
 				if (!confirm.ack()) {
 					recordFailure(event, "nack", "Broker did not accept the event"
-							+ ((confirm.reason() != null) ? ": " + confirm.reason() : ""));
+							+ ((confirm.reason() != null) ? ": " + confirm.reason() : ""), failures);
 				}
 				else if (returned != null) {
 					recordFailure(event, "returned", "No queue is bound to routing key " + returned.getRoutingKey()
-							+ ": " + returned.getReplyCode() + " " + returned.getReplyText());
+							+ ": " + returned.getReplyCode() + " " + returned.getReplyText(), failures);
 				}
 				else {
 					confirmed.add(event.getId());
 				}
 			}
 			catch (TimeoutException ex) {
-				recordFailure(event, "timeout", "No confirmation within " + properties.confirmTimeout());
+				recordFailure(event, "timeout", "No confirmation within " + properties.confirmTimeout(), failures);
 			}
 			catch (ExecutionException ex) {
-				recordFailure(event, "send-error", "Confirmation failed: " + ex.getCause());
+				recordFailure(event, "send-error", "Confirmation failed: " + ex.getCause(), failures);
 			}
 			catch (InterruptedException ex) {
 				// Ends the run (a shutdown that doesn't wait). Events still waiting for their confirmation stay claimed
@@ -228,13 +243,17 @@ class OutboxRelay {
 		return confirmed;
 	}
 
-	/** Records the failed attempt; the event is due again after the retry delay. */
-	private void recordFailure(OutboxEvent event, String reason, String error) {
+	/**
+	 * Records the failed attempt, with its error, in the event's row; the event is due again after the retry delay.
+	 * Logged on its own at {@code DEBUG} only: {@link FailedAttempts} sums up the batch's failures.
+	 */
+	private void recordFailure(OutboxEvent event, String reason, String error, FailedAttempts failures) {
 		Duration retryDelay = retryDelay(event.getAttempts(), properties.initialRetryDelay(),
 				properties.maxRetryDelay());
-		log.warn("Publishing event {} ({}) failed on attempt {}, next attempt in {}: {}", event.getId(),
+		log.debug("Publishing event {} ({}) failed on attempt {}, next attempt in {}: {}", event.getId(),
 				event.getEventType(), event.getAttempts(), retryDelay, error);
 		meterRegistry.counter("chattywap.outbox.failed", "reason", reason).increment();
+		failures.add(event, reason, error, retryDelay);
 		repository.markFailed(event.getId(), event.getAttempts(), truncate(error), retryDelay.toMillis());
 	}
 
@@ -251,11 +270,13 @@ class OutboxRelay {
 
 	/**
 	 * The event as it is published: the stored payload as the body, and its ID as the message ID, which
-	 * consumers can log before they parse the body.
+	 * consumers can log before they parse the body. The correlation ID is the request that wrote the event, for the
+	 * consumers' logs.
 	 */
 	private static Message toMessage(OutboxEvent event) {
 		MessageProperties messageProperties = new MessageProperties();
 		messageProperties.setMessageId(event.getId().toString());
+		messageProperties.setCorrelationId(event.getCorrelationId());
 		messageProperties.setType(event.getEventType());
 		messageProperties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
 		messageProperties.setContentEncoding(StandardCharsets.UTF_8.name());
@@ -273,6 +294,60 @@ class OutboxRelay {
 	}
 
 	private record InFlight(OutboxEvent event, CorrelationData correlation) {
+	}
+
+	/**
+	 * The failed attempts of one batch, summed up by reason, for one {@code WARN} line per reason instead of one per
+	 * event. While RabbitMQ is unreachable every pending event fails on each of its attempts: logged one by one, a
+	 * one-minute outage with messages still being sent wrote 4,000 lines (up to 150 a second). The line names the
+	 * number of events, the first one with its attempt and error, and the range of their next attempts; each event's
+	 * error is also in its row ({@code last_error}).
+	 */
+	private static final class FailedAttempts {
+
+		private final Map<String, Failures> byReason = new LinkedHashMap<>();
+
+		void add(OutboxEvent event, String reason, String error, Duration retryDelay) {
+			Failures failures = byReason.computeIfAbsent(reason, ignored -> new Failures(event, error));
+			failures.count++;
+			failures.shortestDelay = min(failures.shortestDelay, retryDelay);
+			failures.longestDelay = max(failures.longestDelay, retryDelay);
+		}
+
+		void log() {
+			byReason.forEach((reason, failures) -> OutboxRelay.log.warn(
+					"Publishing {} outbox event(s) failed ({}), next attempts in {} to {}; first: event {} ({}) on attempt {}: {}",
+					failures.count, reason, failures.shortestDelay, failures.longestDelay, failures.first.getId(),
+					failures.first.getEventType(), failures.first.getAttempts(), failures.firstError));
+		}
+
+		private static Duration min(Duration a, Duration b) {
+			return (a == null || b.compareTo(a) < 0) ? b : a;
+		}
+
+		private static Duration max(Duration a, Duration b) {
+			return (a == null || b.compareTo(a) > 0) ? b : a;
+		}
+
+		private static final class Failures {
+
+			private final OutboxEvent first;
+
+			private final String firstError;
+
+			private int count;
+
+			private Duration shortestDelay;
+
+			private Duration longestDelay;
+
+			Failures(OutboxEvent first, String firstError) {
+				this.first = first;
+				this.firstError = firstError;
+			}
+
+		}
+
 	}
 
 }

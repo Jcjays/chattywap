@@ -17,12 +17,25 @@ public class TestcontainersConfiguration {
 	@Bean
 	@ServiceConnection
 	PostgreSQLContainer postgresContainer() {
-		return new PostgreSQLContainer(DockerImageName.parse("postgres:18.6"));
+		return postgres();
 	}
 
 	@Bean
 	@ServiceConnection
 	RabbitMQContainer rabbitContainer() {
+		return rabbitMq();
+	}
+
+	/**
+	 * A PostgreSQL container, not started yet: for tests that start applications themselves, such as several
+	 * instances sharing one database.
+	 */
+	public static PostgreSQLContainer postgres() {
+		return new PostgreSQLContainer(DockerImageName.parse("postgres:18.6"));
+	}
+
+	/** A RabbitMQ container, not started yet. */
+	public static RabbitMQContainer rabbitMq() {
 		return new RabbitMQContainer(DockerImageName.parse("rabbitmq:4.3.7-management"));
 	}
 

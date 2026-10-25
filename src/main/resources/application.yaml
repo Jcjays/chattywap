@@ -9,11 +9,32 @@ spring:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:chattywap}
     username: ${POSTGRES_USER}
     password: ${POSTGRES_PASSWORD}
+    hikari:
+      pool-name: chattywap
+      # Connections this instance keeps at most. Every instance opens up to this many, so the sum over all instances
+      # (plus migrations, monitoring and administration) must stay below PostgreSQL's max_connections. Raising it helps
+      # only while PostgreSQL has CPU to spare; see OPERATIONS.md, "Database connections".
+      maximum-pool-size: ${POSTGRES_POOL_SIZE:10}
+      # How long a request waits for a free connection, in milliseconds, before it fails with 503. Hikari's default,
+      # 30 seconds, keeps request threads waiting that long whenever the database is down or the pool is exhausted.
+      connection-timeout: ${POSTGRES_CONNECTION_TIMEOUT_MS:5000}
+      # How long checking a connection before handing it out may take, in milliseconds. Below connection-timeout.
+      validation-timeout: 2000
+      data-source-properties:
+        # Seconds a statement may wait for PostgreSQL's answer before its connection is given up (PostgreSQL JDBC's
+        # socketTimeout, which by default waits forever). Bounds how long a request hangs on a database that stopped
+        # answering without closing the connection, such as after a network failure. Statements here take
+        # milliseconds; a migration that runs longer needs a larger value while it runs.
+        socketTimeout: ${POSTGRES_SOCKET_TIMEOUT:30}
   jpa:
     hibernate:
       # Flyway owns the schema; Hibernate only checks that entities match it.
       ddl-auto: validate
     open-in-view: false
+    properties:
+      # Statements slower than this many milliseconds are logged at INFO by org.hibernate.SQL_SLOW, with their SQL
+      # (parameters as ?, never their values). Waiting for a lock counts.
+      hibernate.log_slow_query: ${SLOW_QUERY_THRESHOLD_MS:500}
   data:
     web:
       pageable:
@@ -68,6 +89,20 @@ chattywap:
     # https://*.example.com allowed), besides pages served by this application. Empty by default.
     # Clients that send no Origin header, such as mobile apps, aren't affected.
     allowed-origins: ${WEBSOCKET_ALLOWED_ORIGINS:}
+    # STOMP heartbeat interval the server offers, in both directions. Connections that ask for heartbeats and then
+    # send nothing for three intervals are closed. 0s turns heartbeats off.
+    heartbeat: 10s
+  messages:
+    # How long a send waits for the sends to the same conversation in front of it, on this instance, before it fails
+    # with 503 (message.ConversationSendGate).
+    send-wait-timeout: 5s
+  logging:
+    # Requests taking at least this long are logged at WARN, like server errors (common.RequestLoggingFilter).
+    slow-request-threshold: 1s
+  http:
+    # Larger request bodies are refused with 413 (common.RequestBodyLimitFilter). The largest valid body, a message of
+    # 4,000 characters, is about 24 KB at most. STOMP frames have their own limit, Spring's 64 KB.
+    max-request-body-size: 64KB
   messaging:
     outbox:
       # Whether this instance publishes outbox events to RabbitMQ. Every instance may: they never claim the same
@@ -86,17 +121,62 @@ chattywap:
       initial-retry-delay: 1s
       max-retry-delay: 5m
 
+server:
+  # Finish requests in progress before stopping (Spring Boot's default, stated here because the runbook relies on it).
+  # The instance reports itself not ready from the start of the shutdown.
+  shutdown: graceful
+  tomcat:
+    # Publishes Tomcat's MBeans, which the tomcat.threads.* metrics read (request threads busy and in total).
+    mbeanregistry:
+      enabled: true
+
 management:
+  server:
+    # Operational endpoints (health details, metrics) are served only on this port, never on the application port.
+    # Keep it unreachable from outside: reaching it is what authorizes an operator. The default address accepts
+    # connections from this machine only; in a deployment, set MANAGEMENT_ADDRESS to the internal interface.
+    port: ${MANAGEMENT_PORT:8081}
+    address: ${MANAGEMENT_ADDRESS:127.0.0.1}
   endpoints:
     web:
       exposure:
-        include: health
+        include: health, info, metrics, prometheus
   endpoint:
     health:
-      # Report each dependency's UP/DOWN status, but never its details.
+      # On the management port: every dependency's status and details (versions, disk space; no credentials).
       show-components: always
-      show-details: never
+      show-details: always
+      probes:
+        enabled: true
+        # Also serves the probes on the application port, as /livez and /readyz, so that they check the server that
+        # handles the traffic. They answer with a status only (the groups below).
+        add-additional-paths: true
+      group:
+        # The process works: only the application's own state. Never a dependency: restarting the instance doesn't
+        # bring PostgreSQL or RabbitMQ back. (A group configured here includes every indicator unless it says which.)
+        liveness:
+          include: livenessState
+          show-components: never
+          show-details: never
+        # The instance takes traffic: started, and not shutting down. Deliberately without PostgreSQL and RabbitMQ:
+        # every instance shares them, so taking instances out of the load balancer wouldn't help, and a pool that is
+        # exhausted under load would take them all out at once. Without RabbitMQ, messages are still stored and
+        # delivered (events wait in the outbox); without PostgreSQL, requests fail fast with 503. Both show in
+        # /actuator/health on the management port.
+        readiness:
+          include: readinessState
+          show-components: never
+          show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      # Latency histograms with these bucket bounds, so that percentiles can be computed over all instances.
+      slo:
+        http.server.requests: 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s
+        hikaricp.connections.acquire: 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s
 
 logging:
-  level:
-    com.adonis.chattywap: debug
+  pattern:
+    # The request ID in every plain-text log line (common.LogContext). Structured formats write it as a field.
+    correlation: "[%X{requestId:-}] "

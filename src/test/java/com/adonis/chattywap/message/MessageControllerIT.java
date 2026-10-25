@@ -115,6 +115,25 @@ class MessageControllerIT {
 	}
 
 	@Test
+	void theRequestIdOfASendIsTheCorrelationIdOfItsEventSoItCanBeTracedToTheConsumers() {
+		TestUser alice = createUser("Alice");
+		UUID group = createGroup(alice);
+
+		MvcTestResult result = mvc.post().uri(messages(group))
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + alice.accessToken())
+				.header("X-Request-Id", "proxy-request-42")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(jsonMapper.writeValueAsString(new SendMessageRequest("Trace me")))
+				.exchange();
+
+		assertThat(result).hasStatus(HttpStatus.CREATED);
+		assertThat(result).hasHeader("X-Request-Id", "proxy-request-42");
+		assertThat(jdbcTemplate.queryForObject(
+				"select correlation_id from outbox_events where payload::jsonb ->> 'messageId' = ?", String.class,
+				id(result).toString())).isEqualTo("proxy-request-42");
+	}
+
+	@Test
 	void bothMembersOfADirectConversationCanSendMessages() {
 		TestUser alice = createUser("Alice");
 		TestUser bob = createUser("Bob");

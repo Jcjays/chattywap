@@ -1,11 +1,13 @@
 package com.adonis.chattywap.messaging;
 
+import com.adonis.chattywap.common.LogContext;
 import com.adonis.chattywap.message.dto.MessageResponse;
 import com.adonis.chattywap.message.dto.MessageSentEvent;
 import com.adonis.chattywap.messaging.dto.MessageCreatedEvent;
 import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -48,9 +50,11 @@ class OutboxWriter {
 		MessageResponse message = sent.message();
 		MessageCreatedEvent event = MessageCreatedEvent.of(message.id(), message.conversationId(),
 				message.sender().id(), message.createdAt());
-		// persist, not a repository's save: the ID is assigned, so save would first look for an existing row.
+		// persist, not a repository's save: the ID is assigned, so save would first look for an existing row. The
+		// request's ID, from the log context, follows the event to its consumers' logs.
 		entityManager.persist(OutboxEvent.pending(event.eventId(), event.eventType(), event.eventVersion(),
-				MessageCreatedEvent.ROUTING_KEY, jsonMapper.writeValueAsString(event), now()));
+				MessageCreatedEvent.ROUTING_KEY, jsonMapper.writeValueAsString(event), now(),
+				MDC.get(LogContext.REQUEST_ID)));
 		log.debug("Wrote event {} ({}) for message {} to the outbox", event.eventId(), event.eventType(),
 				message.id());
 	}

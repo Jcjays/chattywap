@@ -2,7 +2,6 @@ package com.adonis.chattywap.message;
 
 import com.adonis.chattywap.message.dto.UnreadCountResponse;
 import org.springframework.data.domain.Limit;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -20,21 +19,17 @@ import java.util.UUID;
  */
 interface MessageRepository extends JpaRepository<Message, UUID> {
 
-	String COUNT_BY_CONVERSATION = "select count(*) from Message m where m.conversationId = :conversationId";
-
 	/**
-	 * One page of the conversation's history by offset ({@code OFFSET/FETCH FIRST} in the database).
+	 * One page of the conversation's history by offset ({@code OFFSET/FETCH FIRST} in the database), without a count:
+	 * the caller takes the total from {@link #findLastSequenceNumber}. The cost grows with the offset, because the
+	 * skipped messages are read too; cursors ({@link #findByConversationAfter}) don't have that cost.
 	 */
-	@Query(value = """
+	@Query("""
 			select m from Message m
 			where m.conversationId = :conversationId
 			order by m.createdAt desc, m.id desc
-			""",
-			countQuery = COUNT_BY_CONVERSATION)
-	Page<Message> findPageByConversation(UUID conversationId, Pageable pageable);
-
-	@Query(COUNT_BY_CONVERSATION)
-	long countByConversation(UUID conversationId);
+			""")
+	List<Message> findPageByConversation(UUID conversationId, Pageable pageable);
 
 	/**
 	 * Like {@link #findPageByConversation}, but starts after a position instead of at an offset: returns the
@@ -54,6 +49,10 @@ interface MessageRepository extends JpaRepository<Message, UUID> {
 	/**
 	 * The conversation's highest sequence number, 0 if it has no messages. PostgreSQL reads the last entry of the
 	 * index on {@code (conversation_id, sequence_number)}.
+	 * <p>
+	 * It is also the number of the conversation's messages, whatever their number: sequence numbers start at 1 and
+	 * have no gaps, messages are never deleted, and a number is assigned only once the message before it has
+	 * committed, so the committed messages are always exactly 1 to this number ({@code MessageService}).
 	 */
 	@Query("select coalesce(max(m.sequenceNumber), 0) from Message m where m.conversationId = :conversationId")
 	long findLastSequenceNumber(UUID conversationId);

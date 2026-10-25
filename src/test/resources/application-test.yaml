@@ -15,6 +15,12 @@ chattywap:
       initial-retry-delay: 200ms
       max-retry-delay: 1s
 
+management:
+  server:
+    # A free port for each application context, like the server's in RANDOM_PORT tests: the test JVM keeps several
+    # contexts running. Tests without a real server (MockMvc) have no management server at all.
+    port: 0
+
 spring:
   rabbitmq:
     listener:
