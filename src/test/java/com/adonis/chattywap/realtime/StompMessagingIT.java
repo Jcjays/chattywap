@@ -127,6 +127,10 @@ class StompMessagingIT {
 
 			// The same JSON as the history entry, which stays the record of what was sent.
 			assertThat(historyOf(bob, group).get(0)).isEqualTo(message);
+			// Its event carries the ID the STOMP frame had in the logs, as REST requests' events do.
+			assertThat(jdbcTemplate.queryForObject(
+					"select correlation_id from outbox_events where payload::jsonb ->> 'messageId' = ?", String.class,
+					id.toString())).matches("[0-9a-f-]{36}");
 		}
 	}
 

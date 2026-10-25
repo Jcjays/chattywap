@@ -5,7 +5,10 @@ import com.adonis.chattywap.conversation.ConversationNotFoundException;
 import com.adonis.chattywap.conversation.ConversationService;
 import com.adonis.chattywap.message.dto.MessageResponse;
 import com.adonis.chattywap.user.UserService;
+import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.HikariPoolMXBean;
 import jakarta.persistence.EntityManagerFactory;
+import org.awaitility.Awaitility;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.Test;
@@ -17,6 +20,8 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -66,6 +71,12 @@ class MessageServiceIT {
 
 	@Autowired
 	private EntityManagerFactory entityManagerFactory;
+
+	@Autowired
+	private DataSource dataSource;
+
+	@Autowired
+	private ConversationSendGate sendGate;
 
 	@Test
 	void leavingWaitsForAMessageThatIsBeingSent() throws Exception {
@@ -277,14 +288,112 @@ class MessageServiceIT {
 		long byCursorOne = statementsFor(() -> messageService.listMessagesAfter(alice, oneSender, cursorOne, 5));
 		long byCursorTen = statementsFor(() -> messageService.listMessagesAfter(alice, tenSenders, cursorTen, 5));
 
-		// By number: the membership check, the page, the count and the senders. By cursor, no count.
+		// By number: the membership check, the page, the total (the highest sequence number) and the senders. By
+		// cursor, no total.
 		assertThat(byNumberTen).isEqualTo(byNumberOne).isEqualTo(4);
 		assertThat(byCursorTen).isEqualTo(byCursorOne).isEqualTo(3);
-		// Sending: the membership check, the conversation lock, the membership check under the lock, the members (the
-		// message's recipients), the highest sequence number, the sender, the message, its outbox event and the
-		// conversation's activity time. One statement for the members, however many there are.
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(9);
-		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(9);
+		// Sending: the membership check before the send gate, the membership check before the lock, the conversation
+		// lock, the membership check under the lock, the members (the message's recipients), the highest sequence
+		// number, the sender, the message, its outbox event and the conversation's activity time. One statement for
+		// the members, however many there are.
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, oneSender, "One more"))).isEqualTo(10);
+		assertThat(statementsFor(() -> messageService.sendMessage(alice, tenSenders, "One more"))).isEqualTo(10);
+	}
+
+	@Test
+	void sendsWaitingForTheSameConversationHoldNoDatabaseConnection() throws Exception {
+		UUID alice = createUser();
+		UUID bob = createUser();
+		UUID group = conversationService.createGroupConversation(alice, "Group", List.of(bob)).id();
+		HikariPoolMXBean pool = dataSource.unwrap(HikariDataSource.class).getHikariPoolMXBean();
+		CountDownLatch locked = new CountDownLatch(1);
+		CountDownLatch commit = new CountDownLatch(1);
+		int senders = 6;
+
+		try (ExecutorService executor = Executors.newFixedThreadPool(senders + 1)) {
+			try {
+				// A group change holds the conversation lock, and a connection, until it commits.
+				Future<?> renaming = executor.submit(() -> transactionTemplate.executeWithoutResult(status -> {
+					conversationService.renameGroup(alice, group, "Renamed");
+					status.flush();
+					locked.countDown();
+					await(commit);
+				}));
+				await(locked);
+				List<Future<MessageResponse>> sends = new ArrayList<>();
+				for (int i = 0; i < senders; i++) {
+					int attempt = i;
+					sends.add(executor.submit(() -> messageService.sendMessage(attempt % 2 == 0 ? alice : bob, group,
+							"Message " + attempt)));
+				}
+
+				// Two sends wait for the lock in PostgreSQL; the others wait in the gate, without a connection. Without
+				// the gate, all six would hold one. (Another test's consumer may briefly hold one more.)
+				Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> count("""
+						select count(*) from pg_stat_activity
+						where datname = current_database() and wait_event_type = 'Lock'
+						""") >= ConversationSendGate.SENDS_PER_CONVERSATION);
+				Thread.sleep(200);
+				assertThat(pool.getActiveConnections())
+						.isBetween(1 + ConversationSendGate.SENDS_PER_CONVERSATION, 2 + ConversationSendGate.SENDS_PER_CONVERSATION);
+				commit.countDown();
+
+				renaming.get(30, TimeUnit.SECONDS);
+				List<Long> numbers = new ArrayList<>();
+				for (Future<MessageResponse> send : sends) {
+					numbers.add(send.get(30, TimeUnit.SECONDS).sequenceNumber());
+				}
+				assertThat(numbers).containsExactlyInAnyOrder(1L, 2L, 3L, 4L, 5L, 6L);
+				assertThat(sendGate.size()).isZero();
+			}
+			finally {
+				commit.countDown();
+			}
+		}
+	}
+
+	@Test
+	void nonMembersAreTurnedAwayBeforeTheSendGate() throws Exception {
+		UUID alice = createUser();
+		UUID stranger = createUser();
+		UUID group = conversationService.createGroupConversation(alice, "Group", List.of()).id();
+		CountDownLatch locked = new CountDownLatch(1);
+		CountDownLatch commit = new CountDownLatch(1);
+
+		try (ExecutorService executor = Executors.newFixedThreadPool(1 + ConversationSendGate.SENDS_PER_CONVERSATION)) {
+			try {
+				// A group change holds the conversation lock, so Alice's sends wait for it, and fill the gate.
+				Future<?> renaming = executor.submit(() -> transactionTemplate.executeWithoutResult(status -> {
+					conversationService.renameGroup(alice, group, "Renamed");
+					status.flush();
+					locked.countDown();
+					await(commit);
+				}));
+				await(locked);
+				List<Future<MessageResponse>> sends = new ArrayList<>();
+				for (int i = 0; i < ConversationSendGate.SENDS_PER_CONVERSATION; i++) {
+					sends.add(executor.submit(() -> messageService.sendMessage(alice, group, "Hi")));
+				}
+				// Every send the gate lets in is waiting for the lock: the gate is full.
+				Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> count("""
+						select count(*) from pg_stat_activity
+						where datname = current_database() and wait_event_type = 'Lock'
+						""") >= ConversationSendGate.SENDS_PER_CONVERSATION);
+
+				// A non-member is refused at once, instead of waiting for the gate (and failing as busy after its time
+				// limit): it can't queue up in front of members' sends.
+				assertThatThrownBy(() -> messageService.sendMessage(stranger, group, "Let me in"))
+						.isInstanceOf(ConversationNotFoundException.class);
+				commit.countDown();
+				renaming.get(30, TimeUnit.SECONDS);
+				for (Future<MessageResponse> send : sends) {
+					assertThat(send.get(30, TimeUnit.SECONDS).sequenceNumber()).isPositive();
+				}
+			}
+			finally {
+				commit.countDown();
+			}
+		}
 	}
 
 	/**

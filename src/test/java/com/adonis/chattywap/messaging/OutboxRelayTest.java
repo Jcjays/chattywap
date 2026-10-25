@@ -2,6 +2,7 @@ package com.adonis.chattywap.messaging;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.amqp.AmqpConnectException;
 import org.springframework.amqp.AmqpIOException;
 import org.springframework.amqp.core.Message;
@@ -9,12 +10,15 @@ import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.core.ReturnedMessage;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.IOException;
 import java.net.ConnectException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -41,6 +45,7 @@ import static org.mockito.Mockito.when;
  * checks the same against a real broker; these tests pin down each outcome on its own, including a confirmation that
  * never comes.
  */
+@ExtendWith(OutputCaptureExtension.class)
 class OutboxRelayTest {
 
 	private static final Duration CONFIRM_TIMEOUT = Duration.ofMillis(200);
@@ -102,6 +107,21 @@ class OutboxRelayTest {
 				eq(1000L)));
 		verify(repository, never()).markPublished(anyCollection());
 		assertThat(meterRegistry.counter("chattywap.outbox.failed", "reason", "unreachable").count()).isEqualTo(3);
+	}
+
+	@Test
+	void aBatchsFailedAttemptsAreLoggedOncePerReasonNotOncePerEvent(CapturedOutput output) {
+		List<OutboxEvent> batch = List.of(claimedEvent(), claimedEvent(), claimedEvent());
+		when(repository.claimDue(anyInt(), anyLong())).thenReturn(batch);
+		doThrow(new AmqpConnectException(new ConnectException("Connection refused"))).when(rabbitTemplate)
+				.send(anyString(), anyString(), any(Message.class), any(CorrelationData.class));
+
+		relay.publishPending();
+
+		assertThat(output.getOut().lines().filter(line -> line.contains("WARN"))).singleElement().asString()
+				.contains("Publishing 3 outbox event(s) failed (unreachable)")
+				.contains(batch.getFirst().getId().toString())
+				.contains("Connection refused");
 	}
 
 	@Test
@@ -182,9 +202,33 @@ class OutboxRelayTest {
 		assertThat(OutboxRelay.retryDelay(Integer.MAX_VALUE, initial, max)).isEqualTo(max);
 	}
 
+	@Test
+	void theRequestThatWroteAnEventIsPublishedAsItsCorrelationId() {
+		OutboxEvent fromRequest = claimedEvent("request-1");
+		OutboxEvent withoutRequest = claimedEvent(null);
+		when(repository.claimDue(anyInt(), anyLong())).thenReturn(List.of(fromRequest, withoutRequest));
+		Map<UUID, String> correlationIds = new HashMap<>();
+		doAnswer(invocation -> {
+			MessageProperties properties = invocation.<Message>getArgument(2).getMessageProperties();
+			correlationIds.put(UUID.fromString(properties.getMessageId()), properties.getCorrelationId());
+			invocation.<CorrelationData>getArgument(3).getFuture().complete(new CorrelationData.Confirm(true, null));
+			return null;
+		}).when(rabbitTemplate).send(anyString(), anyString(), any(Message.class), any(CorrelationData.class));
+
+		relay.publishPending();
+
+		assertThat(correlationIds).containsEntry(fromRequest.getId(), "request-1")
+				.containsEntry(withoutRequest.getId(), null);
+	}
+
 	/** An event as a claim returns it: its first attempt counted. */
 	private static OutboxEvent claimedEvent() {
-		OutboxEvent event = OutboxEvent.pending(UUID.randomUUID(), "TestEvent", 1, "test.event", "{}", Instant.now());
+		return claimedEvent(null);
+	}
+
+	private static OutboxEvent claimedEvent(String correlationId) {
+		OutboxEvent event = OutboxEvent.pending(UUID.randomUUID(), "TestEvent", 1, "test.event", "{}", Instant.now(),
+				correlationId);
 		ReflectionTestUtils.setField(event, "attempts", 1);
 		return event;
 	}

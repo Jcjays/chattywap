@@ -1,10 +1,12 @@
 package com.adonis.chattywap.messaging;
 
+import com.adonis.chattywap.common.LogContext;
 import com.adonis.chattywap.messaging.dto.MessageCreatedEvent;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.MDC;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.dao.CannotAcquireLockException;
@@ -12,6 +14,8 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -118,6 +122,40 @@ class MessageCountConsumerTest {
 
 		assertThatThrownBy(() -> consumer.onMessageCreated(message(VALID))).isSameAs(failure);
 		assertThat(MessagingConfig.isRetryable(failure)).isTrue();
+	}
+
+	@Test
+	void theEventAndTheRequestThatWroteItAreInTheLogContextWhileTheEventIsProcessed() {
+		Message message = message(VALID);
+		message.getMessageProperties().setCorrelationId("request-1");
+		Map<String, String> duringProcessing = new HashMap<>();
+		when(service.recordMessageCreated(any())).thenAnswer(invocation -> {
+			duringProcessing.put("eventId", MDC.get(LogContext.EVENT_ID));
+			duringProcessing.put("requestId", MDC.get(LogContext.REQUEST_ID));
+			return true;
+		});
+
+		consumer.onMessageCreated(message);
+
+		assertThat(duringProcessing).containsEntry("eventId", message.getMessageProperties().getMessageId())
+				.containsEntry("requestId", "request-1");
+		assertThat(MDC.get(LogContext.EVENT_ID)).isNull();
+		assertThat(MDC.get(LogContext.REQUEST_ID)).isNull();
+	}
+
+	@Test
+	void aCorrelationIdThatIsNoIdIsLeftOutOfTheLogContext() {
+		Message message = message(VALID);
+		message.getMessageProperties().setCorrelationId("forged\nlog line");
+		Map<String, String> duringProcessing = new HashMap<>();
+		when(service.recordMessageCreated(any())).thenAnswer(invocation -> {
+			duringProcessing.put("requestId", MDC.get(LogContext.REQUEST_ID));
+			return true;
+		});
+
+		consumer.onMessageCreated(message);
+
+		assertThat(duringProcessing).containsEntry("requestId", null);
 	}
 
 	private static Message message(String body) {

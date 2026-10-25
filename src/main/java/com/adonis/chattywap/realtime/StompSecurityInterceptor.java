@@ -1,6 +1,8 @@
 package com.adonis.chattywap.realtime;
 
+import com.adonis.chattywap.common.DatabaseUnavailable;
 import com.adonis.chattywap.conversation.ConversationService;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -90,18 +92,22 @@ class StompSecurityInterceptor implements ChannelInterceptor {
 
 	private final MessageChannel clientOutboundChannel;
 
+	private final MeterRegistry meterRegistry;
+
 	/**
 	 * @param clientOutboundChannel where ERROR frames go. It is created by the broker configuration, which needs this
 	 *                              interceptor first, so it is looked up when the first frame is rejected.
 	 */
 	StompSecurityInterceptor(JwtDecoder jwtDecoder, ConversationService conversationService,
 			ProblemDetailStompErrorHandler errorHandler,
-			@Lazy @Qualifier("clientOutboundChannel") MessageChannel clientOutboundChannel) {
+			@Lazy @Qualifier("clientOutboundChannel") MessageChannel clientOutboundChannel,
+			MeterRegistry meterRegistry) {
 		this.jwtDecoder = jwtDecoder;
 		this.authenticationProvider = new JwtAuthenticationProvider(jwtDecoder);
 		this.conversationService = conversationService;
 		this.errorHandler = errorHandler;
 		this.clientOutboundChannel = clientOutboundChannel;
+		this.meterRegistry = meterRegistry;
 	}
 
 	/**
@@ -123,6 +129,11 @@ class StompSecurityInterceptor implements ChannelInterceptor {
 			return reject(frame, ex.getBody());
 		}
 		catch (RuntimeException ex) {
+			if (DatabaseUnavailable.isCause(ex)) {
+				log.warn("Database unavailable while checking a STOMP {} frame: {}", frame.getCommand(),
+						DatabaseUnavailable.describe(ex));
+				return reject(frame, DatabaseUnavailable.problem());
+			}
 			log.error("Unexpected error while checking a STOMP {} frame", frame.getCommand(), ex);
 			return reject(frame, ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR,
 					"An unexpected error occurred."));
@@ -217,9 +228,15 @@ class StompSecurityInterceptor implements ChannelInterceptor {
 	}
 
 	/**
-	 * Sends the client an ERROR frame, after which the server closes the connection, and drops the frame.
+	 * Sends the client an ERROR frame, after which the server closes the connection, and drops the frame. Counted in
+	 * {@code chattywap.stomp.frames.rejected}, by command and status: failed authentications are {@code CONNECT} with
+	 * 401, refused subscriptions {@code SUBSCRIBE} with 404.
 	 */
 	private Message<?> reject(StompHeaderAccessor frame, ProblemDetail problem) {
+		String command = (frame.getCommand() != null) ? frame.getCommand().name() : "NONE";
+		meterRegistry.counter("chattywap.stomp.frames.rejected", "command", command, "status",
+				String.valueOf(problem.getStatus())).increment();
+		log.debug("Rejected a STOMP {} frame: {} {}", command, problem.getStatus(), problem.getDetail());
 		ProblemDetailStompErrorHandler.forDestination(problem, frame.getDestination());
 		clientOutboundChannel.send(errorHandler.errorFrame(problem, frame));
 		return null;

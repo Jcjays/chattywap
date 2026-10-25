@@ -39,6 +39,9 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
  * </ul>
  * Spring declares these when it first connects to the broker, and again after every reconnect. Queue arguments
  * can't change on an existing queue: changing them needs a new queue name, or deleting the queue first.
+ * <p>
+ * Live deliveries between application instances have an exchange and queues of their own, outside these events
+ * ({@link RealtimeFanoutConfig}).
  */
 @Configuration(proxyBeanMethods = false)
 @EnableScheduling
@@ -141,8 +144,14 @@ class MessagingConfig {
 	MessageRecoverer deadLetteringMessageRecoverer(MeterRegistry meterRegistry) {
 		return (message, cause) -> {
 			String queue = message.getMessageProperties().getConsumerQueue();
-			log.error("Dead-lettering message {} from queue {}: {}", message.getMessageProperties().getMessageId(),
-					queue, describe(cause));
+			EventLogContext.set(message);
+			try {
+				log.error("Dead-lettering message {} from queue {}: {}", message.getMessageProperties().getMessageId(),
+						queue, describe(cause));
+			}
+			finally {
+				EventLogContext.clear();
+			}
 			meterRegistry.counter("chattywap.events.dead.lettered", "queue", String.valueOf(queue)).increment();
 			throw new ListenerExecutionFailedException("Message dead-lettered",
 					new AmqpRejectAndDontRequeueException(cause), message);

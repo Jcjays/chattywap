@@ -1,8 +1,10 @@
 package com.adonis.chattywap.realtime;
 
+import com.adonis.chattywap.common.DatabaseUnavailable;
 import com.adonis.chattywap.common.FieldViolation;
 import com.adonis.chattywap.message.MessageService;
 import com.adonis.chattywap.message.dto.SendMessageRequest;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,18 +47,26 @@ class MessageStompController {
 
 	private final MessageService messageService;
 
-	MessageStompController(MessageService messageService) {
+	private final MeterRegistry meterRegistry;
+
+	MessageStompController(MessageService messageService, MeterRegistry meterRegistry) {
 		this.messageService = messageService;
+		this.meterRegistry = meterRegistry;
 	}
 
 	/**
 	 * {@link StompSecurityInterceptor} has already checked that the connection is authenticated and the destination
 	 * names a conversation ID, so the ID always converts.
+	 * <p>
+	 * Every SEND frame is counted in {@code chattywap.stomp.sends}, by {@code outcome}: {@code stored}, {@code invalid}
+	 * (the payload), {@code rejected} (by the service, such as a non-member), {@code unavailable} (the database) or
+	 * {@code error}. REST requests have the same in {@code http.server.requests}.
 	 */
 	@MessageMapping(WebSocketConfig.SEND_MESSAGE)
 	void send(@DestinationVariable UUID conversationId, @Valid @Payload SendMessageRequest request,
 			Authentication authentication) {
 		messageService.sendMessage(UUID.fromString(authentication.getName()), conversationId, request.content());
+		count("stored");
 	}
 
 	/**
@@ -66,6 +76,7 @@ class MessageStompController {
 	@MessageExceptionHandler
 	@SendToUser(destinations = WebSocketConfig.ERRORS_QUEUE, broadcast = false)
 	ProblemDetail invalidPayload(MethodArgumentNotValidException ex, @Header(DESTINATION) String destination) {
+		count("invalid");
 		BindingResult bindingResult = ex.getBindingResult();
 		if (bindingResult == null || !bindingResult.hasFieldErrors()) {
 			return badPayload(destination);
@@ -81,6 +92,7 @@ class MessageStompController {
 	@MessageExceptionHandler
 	@SendToUser(destinations = WebSocketConfig.ERRORS_QUEUE, broadcast = false)
 	ProblemDetail unreadablePayload(MessageConversionException ex, @Header(DESTINATION) String destination) {
+		count("invalid");
 		return badPayload(destination);
 	}
 
@@ -91,20 +103,32 @@ class MessageStompController {
 	@MessageExceptionHandler
 	@SendToUser(destinations = WebSocketConfig.ERRORS_QUEUE, broadcast = false)
 	ProblemDetail rejected(ErrorResponseException ex, @Header(DESTINATION) String destination) {
+		count("rejected");
 		return ProblemDetailStompErrorHandler.forDestination(ex.getBody(), destination);
 	}
 
 	/**
 	 * Anything else is a bug or an infrastructure failure, such as a message that couldn't be stored. The client gets
-	 * a generic message; the details go to the server log only.
+	 * a generic message; the details go to the server log only. A database that can't be used at the moment is
+	 * answered with 503, like REST requests.
 	 */
 	@MessageExceptionHandler
 	@SendToUser(destinations = WebSocketConfig.ERRORS_QUEUE, broadcast = false)
 	ProblemDetail unexpected(Exception ex, @Header(DESTINATION) String destination) {
+		if (DatabaseUnavailable.isCause(ex)) {
+			count("unavailable");
+			log.warn("Database unavailable while handling a STOMP message: {}", DatabaseUnavailable.describe(ex));
+			return ProblemDetailStompErrorHandler.forDestination(DatabaseUnavailable.problem(), destination);
+		}
+		count("error");
 		log.error("Unexpected error while handling a STOMP message", ex);
 		return ProblemDetailStompErrorHandler.forDestination(
 				ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred."),
 				destination);
+	}
+
+	private void count(String outcome) {
+		meterRegistry.counter("chattywap.stomp.sends", "outcome", outcome).increment();
 	}
 
 	private static ProblemDetail badPayload(String destination) {
